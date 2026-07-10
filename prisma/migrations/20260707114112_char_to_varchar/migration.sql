@@ -1,0 +1,12 @@
+-- AlterTable
+ALTER TABLE "business" ALTER COLUMN "theme_color" SET DATA TYPE VARCHAR(20);
+
+-- AlterTable
+ALTER TABLE "business_locations" ALTER COLUMN "zip_code" SET DATA TYPE VARCHAR(7);
+
+-- AlterTable
+ALTER TABLE "users" ALTER COLUMN "surname" SET DATA TYPE VARCHAR(10),
+ALTER COLUMN "language" SET DATA TYPE VARCHAR(7),
+ALTER COLUMN "contact_no" SET DATA TYPE VARCHAR(15),
+ALTER COLUMN "blood_group" SET DATA TYPE VARCHAR(10),
+ALTER COLUMN "contact_number" SET DATA TYPE VARCHAR(20);

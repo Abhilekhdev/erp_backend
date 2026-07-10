@@ -1,0 +1,1189 @@
+// ============================================================================
+//  ERP_Panel — Prisma Schema
+//  Slice 1: Authentication · RBAC · Tenancy (Business/Users/Roles/Permissions)
+// ----------------------------------------------------------------------------
+//  Source of truth: GOURI_DEV (Laravel 9 / UltimatePOS) migrations, verified
+//  column-by-column. Every legacy column is preserved (mapped to its original
+//  snake_case name via @map / @@map for faithful MySQL -> PostgreSQL import).
+//
+//  Modern upgrades applied (confirmed 2026-07-06):
+//   - Tenancy: shared DB, row-level `business_id` (enforced by Prisma extension).
+//   - Login by EMAIL (email required + unique); `username` kept optional.
+//   - Passwords: Node scrypt -> `password_hash` (format `scrypt$N$r$p$salt$hash`); no native build.
+//     Legacy Laravel bcrypt hashes are NOT verified here — those accounts reset at migration time.
+//   - JWT + rotating refresh tokens (RefreshToken) replace Passport oauth_* tables.
+//   - Spatie polymorphic pivots simplified to explicit User<->Role/Permission joins.
+//   - Location access modeled as a first-class relation (UserLocation) instead of
+//     `location.{id}` permission rows. `access_all_locations` stays a permission.
+//   - Legacy JSON-in-TEXT settings columns promoted to JSONB.
+//   - `password_resets` upgraded with token hashing + expiry.
+//   - `sessions` table dropped (stateless JWT).
+//
+//  NOTE: PostgreSQL has no UNSIGNED integers; legacy `int unsigned` -> Int.
+//        Columns referencing not-yet-modeled tables (contacts, essentials_*,
+//        invoice_schemes, tax_rates) are kept as scalar Ints without a relation;
+//        their FK relations are added when those modules are built.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===================== ENUMS ================================================
+
+enum UserType {
+  USER          @map("user")
+  USER_CUSTOMER @map("user_customer")
+}
+
+enum UserStatus {
+  ACTIVE     @map("active")
+  INACTIVE   @map("inactive")
+  TERMINATED @map("terminated")
+}
+
+enum MaritalStatus {
+  MARRIED   @map("married")
+  UNMARRIED @map("unmarried")
+  DIVORCED  @map("divorced")
+}
+
+enum AccountingMethod {
+  FIFO @map("fifo")
+  LIFO @map("lifo")
+  AVCO @map("avco")
+}
+
+enum SellPriceTax {
+  INCLUDES @map("includes")
+  EXCLUDES @map("excludes")
+}
+
+enum CurrencySymbolPlacement {
+  BEFORE @map("before")
+  AFTER  @map("after")
+}
+
+enum TimeFormat {
+  H12 @map("12")
+  H24 @map("24")
+}
+
+enum SalesCommissionAgentSetting {
+  LOGGED_IN_USER @map("logged_in_user")
+  USER           @map("user")
+  CMSN_AGNT      @map("cmsn_agnt")
+}
+
+enum ReceiptPrinterType {
+  BROWSER @map("browser")
+  PRINTER @map("printer")
+}
+
+enum ExpiryType {
+  ADD_EXPIRY        @map("add_expiry")
+  ADD_MANUFACTURING @map("add_manufacturing")
+}
+
+enum OnProductExpiry {
+  KEEP_SELLING @map("keep_selling")
+  STOP_SELLING @map("stop_selling")
+  AUTO_DELETE  @map("auto_delete")
+}
+
+enum RewardPointExpiryType {
+  MONTH @map("month")
+  YEAR  @map("year")
+}
+
+enum LeaveCountInterval {
+  MONTH @map("month")
+  YEAR  @map("year")
+}
+
+enum LeaveStatus {
+  PENDING   @map("pending")
+  APPROVED  @map("approved")
+  CANCELLED @map("cancelled") // rendered as "Rejected" in the UI (matches GOURI)
+}
+
+// Pay-component (allowance/deduction) classification — legacy `type` enum.
+enum AllowanceDeductionType {
+  ALLOWANCE @map("allowance")
+  DEDUCTION @map("deduction")
+}
+
+// How a pay component's amount is interpreted — legacy `amount_type` enum ('test' kept for parity).
+enum AmountType {
+  FIXED   @map("fixed")
+  PERCENT @map("percent")
+  TEST    @map("test")
+}
+
+enum ShiftType {
+  FIXED    @map("fixed_shift")
+  FLEXIBLE @map("flexible_shift")
+}
+
+// Invoice numbering format — legacy `invoice_schemes.scheme_type` enum.
+enum SchemeType {
+  BLANK @map("blank") // prefix + running number (XXXX)
+  YEAR  @map("year") // prefix + current year + separator + running number
+}
+
+enum PayrollGroupStatus {
+  DRAFT @map("draft")
+  FINAL @map("final")
+}
+
+enum PaymentStatus {
+  DUE     @map("due")
+  PARTIAL @map("partial")
+  PAID    @map("paid")
+}
+
+enum PayTermType {
+  DAYS   @map("days")
+  MONTHS @map("months")
+}
+
+// ===================== TENANCY =============================================
+
+/// Currency master (global, shared across tenants).
+model Currency {
+  id                Int       @id @default(autoincrement())
+  country           String    @db.VarChar(100)
+  currency          String    @db.VarChar(100)
+  code              String    @db.VarChar(25)
+  symbol            String    @db.VarChar(25)
+  thousandSeparator String    @map("thousand_separator") @db.VarChar(10)
+  decimalSeparator  String    @map("decimal_separator") @db.VarChar(10)
+  createdAt         DateTime? @map("created_at")
+  updatedAt         DateTime? @updatedAt @map("updated_at")
+
+  businesses         Business[] @relation("BusinessCurrency")
+  purchaseBusinesses Business[] @relation("BusinessPurchaseCurrency")
+
+  @@map("currencies")
+}
+
+/// The tenant root. Every tenant-scoped row references `business_id`.
+model Business {
+  id   Int    @id @default(autoincrement())
+  name String @db.VarChar(255)
+
+  // --- Financial / accounting ---
+  currencyId              Int                     @map("currency_id")
+  startDate               DateTime?               @map("start_date") @db.Date
+  taxNumber1              String?                 @map("tax_number_1") @db.VarChar(100)
+  taxLabel1               String?                 @map("tax_label_1") @db.VarChar(10)
+  taxNumber2              String?                 @map("tax_number_2") @db.VarChar(100)
+  taxLabel2               String?                 @map("tax_label_2") @db.VarChar(10)
+  codeLabel1              String?                 @map("code_label_1") @db.VarChar(255)
+  code1                   String?                 @map("code_1") @db.VarChar(255)
+  codeLabel2              String?                 @map("code_label_2") @db.VarChar(255)
+  code2                   String?                 @map("code_2") @db.VarChar(255)
+  defaultSalesTax         Int?                    @map("default_sales_tax") // FK -> tax_rates (later module)
+  defaultProfitPercent    Decimal                 @default(0) @map("default_profit_percent") @db.Decimal(5, 2)
+  ownerId                 Int                     @map("owner_id")
+  timeZone                String                  @default("Asia/Kolkata") @map("time_zone") @db.VarChar(255)
+  fyStartMonth            Int                     @default(1) @map("fy_start_month") @db.SmallInt
+  accountingMethod        AccountingMethod        @default(FIFO) @map("accounting_method")
+  defaultSalesDiscount    Decimal?                @map("default_sales_discount") @db.Decimal(5, 2)
+  sellPriceTax            SellPriceTax            @default(INCLUDES) @map("sell_price_tax")
+  currencyPrecision       Int                     @default(2) @map("currency_precision") @db.SmallInt
+  quantityPrecision       Int                     @default(2) @map("quantity_precision") @db.SmallInt
+  currencySymbolPlacement CurrencySymbolPlacement @default(BEFORE) @map("currency_symbol_placement")
+
+  // --- Multi-currency purchase ---
+  purchaseInDiffCurrency Boolean @default(false) @map("purchase_in_diff_currency")
+  purchaseCurrencyId     Int?    @map("purchase_currency_id")
+  pExchangeRate          Decimal @default(1) @map("p_exchange_rate") @db.Decimal(20, 3)
+
+  // --- Branding / theme ---
+  logo       String? @db.VarChar(255)
+  loginLogo  String? @map("login_logo") @db.VarChar(255)
+  skuPrefix  String? @map("sku_prefix") @db.VarChar(255)
+  themeColor String? @map("theme_color") @db.VarChar(20)
+
+  // --- Product catalogue toggles ---
+  enableBrand                      Boolean  @default(true) @map("enable_brand")
+  enableCategory                   Boolean  @default(true) @map("enable_category")
+  enableSubCategory                Boolean  @default(true) @map("enable_sub_category")
+  enablePriceTax                   Boolean  @default(true) @map("enable_price_tax")
+  enablePurchaseStatus             Boolean? @default(true) @map("enable_purchase_status")
+  enableLotNumber                  Boolean  @default(false) @map("enable_lot_number")
+  enableSubUnits                   Boolean  @default(false) @map("enable_sub_units")
+  enableRacks                      Boolean  @default(false) @map("enable_racks")
+  enableRow                        Boolean  @default(false) @map("enable_row")
+  enablePosition                   Boolean  @default(false) @map("enable_position")
+  enableEditingProductFromPurchase Boolean  @default(true) @map("enable_editing_product_from_purchase")
+  enableTooltip                    Boolean  @default(true) @map("enable_tooltip")
+  defaultUnit                      Int?     @map("default_unit")
+  descriptionDefault               Int      @default(1) @map("description_default")
+
+  // --- Product expiry ---
+  enableProductExpiry  Boolean         @default(false) @map("enable_product_expiry")
+  expiryType           ExpiryType      @default(ADD_EXPIRY) @map("expiry_type")
+  onProductExpiry      OnProductExpiry @default(KEEP_SELLING) @map("on_product_expiry")
+  stopSellingBefore    Int?            @map("stop_selling_before")
+  stockExpiryAlertDays Int             @default(30) @map("stock_expiry_alert_days")
+
+  // --- Transactions / POS / sell ---
+  transactionEditDays Int                          @default(30) @map("transaction_edit_days")
+  salesCmsnAgnt       SalesCommissionAgentSetting? @map("sales_cmsn_agnt")
+  itemAdditionMethod  Boolean                      @default(true) @map("item_addition_method")
+  enableInlineTax     Boolean                      @default(true) @map("enable_inline_tax")
+  dateFormat          String                       @default("m/d/Y") @map("date_format") @db.VarChar(255)
+  timeFormat          TimeFormat                   @default(H24) @map("time_format")
+
+  // --- JSON settings (legacy TEXT/LONGTEXT -> JSONB) ---
+  keyboardShortcuts     Json? @map("keyboard_shortcuts")
+  posSettings           Json? @map("pos_settings")
+  manufacturingSettings Json? @map("manufacturing_settings")
+  essentialsSettings    Json? @map("essentials_settings")
+  weighingScaleSetting  Json? @map("weighing_scale_setting")
+  enabledModules        Json? @map("enabled_modules")
+  refNoPrefixes         Json? @map("ref_no_prefixes")
+  emailSettings         Json? @map("email_settings")
+  smsSettings           Json? @map("sms_settings")
+  customLabels          Json? @map("custom_labels")
+  commonSettings        Json? @map("common_settings")
+
+  // --- Reward points ---
+  enableRp               Boolean               @default(false) @map("enable_rp")
+  rpName                 String?               @map("rp_name") @db.VarChar(255)
+  amountForUnitRp        Decimal               @default(1) @map("amount_for_unit_rp") @db.Decimal(22, 4)
+  minOrderTotalForRp     Decimal               @default(1) @map("min_order_total_for_rp") @db.Decimal(22, 4)
+  maxRpPerOrder          Int?                  @map("max_rp_per_order")
+  redeemAmountPerUnitRp  Decimal               @default(1) @map("redeem_amount_per_unit_rp") @db.Decimal(22, 4)
+  minOrderTotalForRedeem Decimal               @default(1) @map("min_order_total_for_redeem") @db.Decimal(22, 4)
+  minRedeemPoint         Int?                  @map("min_redeem_point")
+  maxRedeemPoint         Int?                  @map("max_redeem_point")
+  rpExpiryPeriod         Int?                  @map("rp_expiry_period")
+  rpExpiryType           RewardPointExpiryType @default(YEAR) @map("rp_expiry_type")
+
+  // --- Lifecycle / status (drives login gate) ---
+  isActive  Boolean   @default(true) @map("is_active")
+  accountNo String?   @map("account_no") @db.VarChar(100)
+  createdBy Int?      @map("created_by")
+  createdAt DateTime? @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  // --- Relations ---
+  currency              Currency                          @relation("BusinessCurrency", fields: [currencyId], references: [id])
+  purchaseCurrency      Currency?                         @relation("BusinessPurchaseCurrency", fields: [purchaseCurrencyId], references: [id])
+  owner                 User                              @relation("BusinessOwner", fields: [ownerId], references: [id])
+  users                 User[]                            @relation("BusinessUsers")
+  locations             BusinessLocation[]
+  roles                 Role[]
+  departments           Department[]
+  designations          Designation[]
+  leaveTypes            LeaveType[]
+  userLeaveBalances     UserLeaveBalance[]
+  leaves                Leave[]
+  holidays              Holiday[]
+  activityCodes         ActivityCode[]
+  allowanceDeductions   EssentialsAllowanceAndDeduction[]
+  shifts                Shift[]
+  userShifts            UserShift[]
+  attendances           Attendance[]
+  salesTargets          EssentialsUserSalesTarget[]
+  payrollGroups         PayrollGroup[]
+  payrolls              Payroll[]
+  auditLogs             AuditLog[]
+  notificationTemplates NotificationTemplate[]
+  invoiceSchemes        InvoiceScheme[]
+  contacts              Contact[]
+  customerGroups        CustomerGroup[]
+
+  @@index([currencyId])
+  @@index([ownerId])
+  @@index([isActive])
+  @@index([purchaseCurrencyId])
+  @@map("business")
+}
+
+// ===================== HRM (ESSENTIALS) ====================================
+// Employee org lists. In legacy UltimatePOS these are `categories` rows keyed by
+// category_type ('hrm_department'/'hrm_designation'); we model them as dedicated,
+// business-scoped tables. `User.essentialsDepartmentId/DesignationId` reference these
+// by id (kept as bare Ints, app-level integrity — matching legacy, no DB FK).
+
+model Department {
+  id          Int       @id @default(autoincrement())
+  businessId  Int       @map("business_id")
+  name        String    @db.VarChar(255)
+  shortCode   String?   @map("short_code") @db.VarChar(255) // "Department ID" / code
+  description String?   @db.Text
+  createdBy   Int?      @map("created_by")
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime? @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("departments")
+}
+
+model Designation {
+  id          Int       @id @default(autoincrement())
+  businessId  Int       @map("business_id")
+  name        String    @db.VarChar(255)
+  shortCode   String?   @map("short_code") @db.VarChar(255)
+  description String?   @db.Text
+  createdBy   Int?      @map("created_by")
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime? @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("designations")
+}
+
+// Leave catalogue. `maxLeaveCount`/`leaveCountInterval` are descriptive (Laravel never enforces them);
+// `isPaid` maps legacy `type` (0 = paid → balance-tracked, else unpaid). Per-user balances live in a
+// separate ledger (added with the Leaves flow), not derived from maxLeaveCount.
+model LeaveType {
+  id                 Int                 @id @default(autoincrement())
+  businessId         Int                 @map("business_id")
+  name               String              @map("leave_type") @db.VarChar(255)
+  maxLeaveCount      Int?                @map("max_leave_count")
+  leaveCountInterval LeaveCountInterval? @map("leave_count_interval")
+  isPaid             Boolean             @default(true) @map("is_paid")
+  deletedAt          DateTime?           @map("deleted_at")
+  createdAt          DateTime?           @default(now()) @map("created_at")
+  updatedAt          DateTime?           @updatedAt @map("updated_at")
+
+  business Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  balances UserLeaveBalance[]
+  leaves   Leave[]
+
+  @@index([businessId])
+  @@map("leave_types")
+}
+
+// Per-user leave entitlement ledger (legacy `essentials_user_leave_and_deductions`). Balance is
+// decremented when a paid leave is requested and restored if it's cancelled/rejected. The Add-Leave
+// dropdown only offers leave types the user has a row here.
+model UserLeaveBalance {
+  id          Int       @id @default(autoincrement())
+  businessId  Int       @map("business_id")
+  userId      Int       @map("user_id")
+  leaveTypeId Int       @map("leave_type_id")
+  balance     Decimal   @default(0) @db.Decimal(8, 2)
+  createdAt   DateTime? @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  business  Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user      User      @relation("UserLeaveBalances", fields: [userId], references: [id], onDelete: Cascade)
+  leaveType LeaveType @relation(fields: [leaveTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, leaveTypeId])
+  @@index([businessId])
+  @@index([leaveTypeId])
+  @@map("user_leave_balances")
+}
+
+model Leave {
+  id          Int         @id @default(autoincrement())
+  businessId  Int         @map("business_id")
+  leaveTypeId Int         @map("leave_type_id")
+  userId      Int         @map("user_id")
+  refNo       String?     @map("ref_no") @db.VarChar(191)
+  startDate   DateTime    @map("start_date") @db.Date
+  endDate     DateTime    @map("end_date") @db.Date
+  status      LeaveStatus @default(PENDING)
+  reason      String?     @db.Text
+  statusNote  String?     @map("status_note") @db.Text
+  changedBy   Int?        @map("changed_by")
+  changedAt   DateTime?   @map("changed_at")
+  createdAt   DateTime?   @default(now()) @map("created_at")
+  updatedAt   DateTime?   @updatedAt @map("updated_at")
+
+  business  Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  leaveType LeaveType @relation(fields: [leaveTypeId], references: [id])
+  user      User      @relation("UserLeaves", fields: [userId], references: [id])
+
+  @@index([businessId])
+  @@index([userId])
+  @@index([leaveTypeId])
+  @@map("leaves")
+}
+
+// Day's Off — business/location holidays (legacy `essentials_holidays`).
+model Holiday {
+  id         Int       @id @default(autoincrement())
+  businessId Int       @map("business_id")
+  name       String    @db.VarChar(255)
+  startDate  DateTime  @map("start_date") @db.Date
+  endDate    DateTime  @map("end_date") @db.Date
+  locationId Int?      @map("location_id") // null = all locations
+  note       String?   @db.Text
+  createdBy  Int?      @map("created_by")
+  deletedAt  DateTime? @map("deleted_at")
+  createdAt  DateTime? @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  business Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  location BusinessLocation? @relation(fields: [locationId], references: [id])
+
+  @@index([businessId])
+  @@index([locationId])
+  @@map("holidays")
+}
+
+// Activity codes for attendance logging (legacy `essentials_activity_logs`).
+model ActivityCode {
+  id           Int       @id @default(autoincrement())
+  businessId   Int       @map("business_id")
+  activityName String    @map("activity_name") @db.VarChar(255)
+  activityCode String?   @map("activity_code") @db.VarChar(255)
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime? @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("activity_codes")
+}
+
+// Work shifts (legacy `essentials_shifts`). `holidays` = JSON array of weekday names off for this shift.
+model Shift {
+  id                    Int       @id @default(autoincrement())
+  businessId            Int       @map("business_id")
+  name                  String    @db.VarChar(255)
+  type                  ShiftType @default(FIXED)
+  startTime             String?   @map("start_time") @db.VarChar(20) // 'HH:mm'
+  endTime               String?   @map("end_time") @db.VarChar(20)
+  holidays              Json?
+  isAllowedAutoClockout Boolean   @default(false) @map("is_allowed_auto_clockout")
+  autoClockoutTime      String?   @map("auto_clockout_time") @db.VarChar(20)
+  deletedAt             DateTime? @map("deleted_at")
+  createdAt             DateTime? @default(now()) @map("created_at")
+  updatedAt             DateTime? @updatedAt @map("updated_at")
+
+  business    Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userShifts  UserShift[]
+  attendances Attendance[]
+
+  @@index([businessId])
+  @@map("shifts")
+}
+
+// Assigns a user to a shift for a date range (legacy `essentials_user_shifts`).
+model UserShift {
+  id         Int       @id @default(autoincrement())
+  businessId Int       @map("business_id")
+  userId     Int       @map("user_id")
+  shiftId    Int       @map("shift_id")
+  startDate  DateTime? @map("start_date") @db.Date
+  endDate    DateTime? @map("end_date") @db.Date
+  createdAt  DateTime? @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation("UserShifts", fields: [userId], references: [id], onDelete: Cascade)
+  shift    Shift    @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([userId])
+  @@index([shiftId])
+  @@map("user_shifts")
+}
+
+// Clock in/out records (legacy `essentials_attendances`). location = free-text (matches GOURI).
+model Attendance {
+  id               Int       @id @default(autoincrement())
+  businessId       Int       @map("business_id")
+  userId           Int       @map("user_id")
+  clockInTime      DateTime? @map("clock_in_time")
+  clockOutTime     DateTime? @map("clock_out_time")
+  ipAddress        String?   @map("ip_address") @db.VarChar(255)
+  clockInNote      String?   @map("clock_in_note") @db.Text
+  clockOutNote     String?   @map("clock_out_note") @db.Text
+  shiftId          Int?      @map("essentials_shift_id")
+  activityCodeId   Int?      @map("activity_code_id")
+  clockInLocation  String?   @map("clock_in_location") @db.Text
+  clockOutLocation String?   @map("clock_out_location") @db.Text
+  createdAt        DateTime? @default(now()) @map("created_at")
+  updatedAt        DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation("UserAttendances", fields: [userId], references: [id], onDelete: Cascade)
+  shift    Shift?   @relation(fields: [shiftId], references: [id])
+
+  @@index([businessId])
+  @@index([userId])
+  @@index([shiftId])
+  @@map("attendances")
+}
+
+// Structured Commission — per-user tiered sales-target bands (legacy `essentials_user_sales_targets`).
+model EssentialsUserSalesTarget {
+  id                Int       @id @default(autoincrement())
+  businessId        Int       @map("business_id")
+  userId            Int       @map("user_id")
+  targetStart       Decimal   @map("target_start") @db.Decimal(22, 4)
+  targetEnd         Decimal   @map("target_end") @db.Decimal(22, 4)
+  commissionPercent Decimal   @map("commission_percent") @db.Decimal(22, 4)
+  createdAt         DateTime? @default(now()) @map("created_at")
+  updatedAt         DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation("UserSalesTargets", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([userId])
+  @@map("essentials_user_sales_targets")
+}
+
+// Payroll run container (legacy `essentials_payroll_groups`). Bundles one month's payrolls.
+model PayrollGroup {
+  id            Int                @id @default(autoincrement())
+  businessId    Int                @map("business_id")
+  name          String             @db.VarChar(255)
+  status        PayrollGroupStatus @default(DRAFT)
+  paymentStatus PaymentStatus      @default(DUE) @map("payment_status")
+  grossTotal    Decimal            @default(0) @map("gross_total") @db.Decimal(22, 4)
+  locationId    Int?               @map("location_id")
+  month         DateTime           @db.Date // YYYY-MM-01
+  createdBy     Int?               @map("created_by")
+  createdAt     DateTime?          @default(now()) @map("created_at")
+  updatedAt     DateTime?          @updatedAt @map("updated_at")
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  payrolls Payroll[]
+
+  @@index([businessId])
+  @@map("payroll_groups")
+}
+
+// One employee's payroll for a month (legacy: a `transactions` row of type='payroll'; modeled as a
+// dedicated table since transactions isn't built). Allowance/deduction lines are normalized.
+model Payroll {
+  id             Int           @id @default(autoincrement())
+  businessId     Int           @map("business_id")
+  payrollGroupId Int?          @map("payroll_group_id")
+  userId         Int           @map("user_id")
+  month          DateTime      @db.Date
+  refNo          String?       @map("ref_no") @db.VarChar(191)
+  basicSalary    Decimal       @default(0) @map("basic_salary") @db.Decimal(22, 4)
+  finalTotal     Decimal       @default(0) @map("final_total") @db.Decimal(22, 4)
+  status         String        @default("final") @db.VarChar(20)
+  paymentStatus  PaymentStatus @default(DUE) @map("payment_status")
+  createdBy      Int?          @map("created_by")
+  createdAt      DateTime?     @default(now()) @map("created_at")
+  updatedAt      DateTime?     @updatedAt @map("updated_at")
+
+  business Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  group    PayrollGroup? @relation(fields: [payrollGroupId], references: [id], onDelete: SetNull)
+  user     User          @relation("UserPayrolls", fields: [userId], references: [id], onDelete: Cascade)
+  lines    PayrollLine[]
+
+  @@index([businessId])
+  @@index([userId])
+  @@index([payrollGroupId])
+  @@map("payrolls")
+}
+
+// A single allowance/deduction line on a payroll. `amount` is the input; `computed` the resolved value
+// (percent lines = amount% of basicSalary).
+model PayrollLine {
+  id          Int                    @id @default(autoincrement())
+  payrollId   Int                    @map("payroll_id")
+  type        AllowanceDeductionType
+  description String                 @db.VarChar(255)
+  amountType  AmountType             @map("amount_type")
+  amount      Decimal                @db.Decimal(22, 4)
+  computed    Decimal                @map("computed_amount") @db.Decimal(22, 4)
+
+  payroll Payroll @relation(fields: [payrollId], references: [id], onDelete: Cascade)
+
+  @@index([payrollId])
+  @@map("payroll_lines")
+}
+
+// Pay-component master: the allowances & deductions a business defines and assigns to users on the
+// user form (legacy `essentials_allowances_and_deductions`). `amountType` 'test' is preserved for
+// 1:1 parity with the legacy enum even though the UI only offers fixed/percent.
+model EssentialsAllowanceAndDeduction {
+  id             Int                    @id @default(autoincrement())
+  businessId     Int                    @map("business_id")
+  description    String                 @db.VarChar(191)
+  type           AllowanceDeductionType
+  amount         Decimal                @db.Decimal(22, 4)
+  amountType     AmountType             @map("amount_type")
+  applicableDate DateTime?              @map("applicable_date") @db.Date
+  isApproved     Int?                   @map("is_approved")
+  createdAt      DateTime?              @map("created_at")
+  updatedAt      DateTime?              @updatedAt @map("updated_at")
+
+  business Business                              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  users    EssentialsUserAllowanceAndDeduction[]
+
+  @@index([businessId])
+  @@map("essentials_allowances_and_deductions")
+}
+
+// User <-> pay-component assignment (legacy `essentials_user_allowance_and_deductions`, which had no
+// PK). Modeled with a composite PK like the other join tables here.
+model EssentialsUserAllowanceAndDeduction {
+  userId               Int @map("user_id")
+  allowanceDeductionId Int @map("allowance_deduction_id")
+
+  user               User                            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  allowanceDeduction EssentialsAllowanceAndDeduction @relation(fields: [allowanceDeductionId], references: [id], onDelete: Cascade)
+
+  @@id([userId, allowanceDeductionId])
+  @@index([allowanceDeductionId])
+  @@map("essentials_user_allowance_and_deductions")
+}
+
+/// Physical/logical location within a tenant. Second scoping layer.
+model BusinessLocation {
+  id                     Int                @id @default(autoincrement())
+  businessId             Int                @map("business_id")
+  locationId             String?            @map("location_id") @db.VarChar(255) // human ref code (e.g. BL0001)
+  name                   String             @db.VarChar(256)
+  landmark               String?            @db.Text
+  country                String             @db.VarChar(100)
+  state                  String             @db.VarChar(100)
+  city                   String             @db.VarChar(100)
+  zipCode                String             @map("zip_code") @db.VarChar(7)
+  invoiceSchemeId        Int                @map("invoice_scheme_id") // FK -> invoice_schemes (later)
+  saleInvoiceSchemeId    Int?               @map("sale_invoice_scheme_id")
+  invoiceLayoutId        Int                @map("invoice_layout_id") // FK -> invoice_layouts (later)
+  saleInvoiceLayoutId    Int?               @map("sale_invoice_layout_id")
+  sellingPriceGroupId    Int?               @map("selling_price_group_id")
+  printReceiptOnInvoice  Boolean?           @default(true) @map("print_receipt_on_invoice")
+  receiptPrinterType     ReceiptPrinterType @default(BROWSER) @map("receipt_printer_type")
+  printerId              Int?               @map("printer_id")
+  mobile                 String?            @db.VarChar(255)
+  alternateNumber        String?            @map("alternate_number") @db.VarChar(255)
+  email                  String?            @db.VarChar(255)
+  website                String?            @db.VarChar(255)
+  defaultPaymentAccounts Json?              @map("default_payment_accounts")
+  featuredProducts       Json?              @map("featured_products")
+  isActive               Boolean            @default(true) @map("is_active")
+  customField1           String?            @map("custom_field1") @db.VarChar(255)
+  customField2           String?            @map("custom_field2") @db.VarChar(255)
+  customField3           String?            @map("custom_field3") @db.VarChar(255)
+  customField4           String?            @map("custom_field4") @db.VarChar(255)
+  deletedAt              DateTime?          @map("deleted_at")
+  createdAt              DateTime?          @map("created_at")
+  updatedAt              DateTime?          @updatedAt @map("updated_at")
+
+  business        Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userLocations   UserLocation[]
+  primaryForUsers User[]         @relation("UserPrimaryLocation")
+  holidays        Holiday[]
+
+  @@index([businessId])
+  @@index([sellingPriceGroupId])
+  @@index([saleInvoiceLayoutId])
+  @@index([receiptPrinterType])
+  @@index([printerId])
+  @@map("business_locations")
+}
+
+// ===================== IDENTITY (USERS) ====================================
+
+model User {
+  id       Int      @id @default(autoincrement())
+  userType UserType @default(USER) @map("user_type")
+
+  // --- Identity / auth ---
+  surname         String?    @db.VarChar(10)
+  firstName       String     @map("first_name") @db.VarChar(255)
+  lastName        String?    @map("last_name") @db.VarChar(255)
+  username        String?    @unique @db.VarChar(191)
+  email           String     @unique @db.VarChar(255) // MODERN: required + unique (login id)
+  emailVerifiedAt DateTime?  @map("email_verified_at")
+  passwordHash    String     @map("password_hash") @db.VarChar(255)
+  language        String     @default("en") @db.VarChar(7)
+  status          UserStatus @default(ACTIVE)
+  allowLogin      Boolean    @default(true) @map("allow_login")
+  tokenVersion    Int        @default(0) @map("token_version") // bump to invalidate all JWTs
+  lastLoginAt     DateTime?  @map("last_login_at")
+
+  // --- Tenancy ---
+  businessId Int? @map("business_id")
+
+  // --- Contact / commission ---
+  contactNo               String?  @map("contact_no") @db.VarChar(15)
+  address                 String?  @db.Text
+  isCmmsnAgnt             Boolean  @default(false) @map("is_cmmsn_agnt")
+  cmmsnPercent            Decimal  @default(0) @map("cmmsn_percent") @db.Decimal(4, 2)
+  maxSalesDiscountPercent Decimal? @map("max_sales_discount_percent") @db.Decimal(5, 2)
+  selectedContacts        Boolean  @default(false) @map("selected_contacts")
+
+  // --- CRM linkage ---
+  crmContactId Int? @map("crm_contact_id") // FK -> contacts (CRM module)
+
+  // --- Service staff timer (Restaurant) ---
+  availableAt DateTime? @map("available_at")
+  pausedAt    DateTime? @map("paused_at")
+
+  // --- HR / Essentials ---
+  essentialsDepartmentId  Int?     @map("essentials_department_id")
+  essentialsDesignationId Int?     @map("essentials_designation_id")
+  essentialsSalary        Decimal? @map("essentials_salary") @db.Decimal(22, 4)
+  essentialsPayPeriod     String?  @map("essentials_pay_period") @db.VarChar(255)
+  essentialsPayCycle      String?  @map("essentials_pay_cycle") @db.VarChar(255)
+  locationId              Int?     @map("location_id") // primary work location
+
+  // --- Profile ---
+  dob              DateTime?      @db.Date
+  gender           String?        @db.VarChar(255)
+  maritalStatus    MaritalStatus? @map("marital_status")
+  bloodGroup       String?        @map("blood_group") @db.VarChar(10)
+  contactNumber    String?        @map("contact_number") @db.VarChar(20)
+  altNumber        String?        @map("alt_number") @db.VarChar(255)
+  familyNumber     String?        @map("family_number") @db.VarChar(255)
+  fbLink           String?        @map("fb_link") @db.VarChar(255)
+  twitterLink      String?        @map("twitter_link") @db.VarChar(255)
+  socialMedia1     String?        @map("social_media_1") @db.VarChar(255)
+  socialMedia2     String?        @map("social_media_2") @db.VarChar(255)
+  permanentAddress String?        @map("permanent_address") @db.Text
+  currentAddress   String?        @map("current_address") @db.Text
+  guardianName     String?        @map("guardian_name") @db.VarChar(255)
+  customField1     String?        @map("custom_field_1") @db.VarChar(255)
+  customField2     String?        @map("custom_field_2") @db.VarChar(255)
+  customField3     String?        @map("custom_field_3") @db.VarChar(255)
+  customField4     String?        @map("custom_field_4") @db.VarChar(255)
+  bankDetails      String?        @map("bank_details") @db.Text
+  idProofName      String?        @map("id_proof_name") @db.VarChar(255)
+  idProofNumber    String?        @map("id_proof_number") @db.VarChar(255)
+
+  // --- Added directly in the live DB (NOT present in migration files; sourced from SQL dump) ---
+  passwordChangeAt DateTime? @map("password_change_at") // last password change (drives token invalidation)
+  parentId         Int?      @map("parent_id") // user who created/manages this user (self-ref)
+  activityCodes    Json?     @map("activity_codes") // legacy: JSON array of essentials activity codes
+
+  // --- Lifecycle ---
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime? @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  // --- Relations ---
+  business            Business?                             @relation("BusinessUsers", fields: [businessId], references: [id])
+  ownedBusinesses     Business[]                            @relation("BusinessOwner")
+  primaryLocation     BusinessLocation?                     @relation("UserPrimaryLocation", fields: [locationId], references: [id])
+  parent              User?                                 @relation("UserHierarchy", fields: [parentId], references: [id])
+  subordinates        User[]                                @relation("UserHierarchy")
+  roles               UserRole[]
+  permissions         UserPermission[]
+  locations           UserLocation[]
+  leaveBalances       UserLeaveBalance[]                    @relation("UserLeaveBalances")
+  leaves              Leave[]                               @relation("UserLeaves")
+  allowanceDeductions EssentialsUserAllowanceAndDeduction[]
+  userShifts          UserShift[]                           @relation("UserShifts")
+  attendances         Attendance[]                          @relation("UserAttendances")
+  salesTargets        EssentialsUserSalesTarget[]           @relation("UserSalesTargets")
+  payrolls            Payroll[]                             @relation("UserPayrolls")
+  contactAccess       UserContactAccess[]
+  documents           UserDocument[]
+  refreshTokens       RefreshToken[]
+  auditLogs           AuditLog[]
+
+  @@index([businessId])
+  @@index([userType])
+  @@index([status])
+  @@index([essentialsDepartmentId])
+  @@index([essentialsDesignationId])
+  @@index([locationId])
+  @@index([parentId])
+  // Covers the Users list: filter (businessId, userType, deletedAt) + ORDER BY firstName.
+  // The equality/IS NULL prefix lets Postgres return rows already sorted, skipping the in-memory
+  // sort; also serves the manager-dropdown query (same prefix). See UsersService.findAll/meta.
+  @@index([businessId, userType, deletedAt, firstName])
+  @@map("users")
+}
+
+// ===================== RBAC ================================================
+
+/// Tenant-scoped role. Legacy namespaced names ("Admin#15") are replaced by a
+/// clean (business_id, name) unique. The "Admin" role = tenant superuser and is
+/// enforced in code (PermissionsGuard short-circuit), mirroring Laravel's Gate::before.
+model Role {
+  id             Int       @id @default(autoincrement())
+  name           String    @db.VarChar(255)
+  businessId     Int       @map("business_id")
+  isDefault      Boolean   @default(false) @map("is_default")
+  isServiceStaff Boolean   @default(false) @map("is_service_staff")
+  createdAt      DateTime? @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  business    Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@unique([businessId, name])
+  @@index([businessId])
+  @@map("roles")
+}
+
+/// Global permission catalogue (e.g. "sell.create"). `resource`/`action`/`category`
+/// are structured helpers for grouping in the UI; `name` stays the source of truth.
+model Permission {
+  id        Int       @id @default(autoincrement())
+  name      String    @unique @db.VarChar(255)
+  resource  String?   @db.VarChar(100)
+  action    String?   @db.VarChar(100)
+  category  String?   @db.VarChar(100)
+  createdAt DateTime? @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  roles RolePermission[]
+  users UserPermission[]
+
+  @@map("permissions")
+}
+
+/// role_has_permissions
+model RolePermission {
+  roleId       Int @map("role_id")
+  permissionId Int @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_has_permissions")
+}
+
+/// model_has_roles (specialized to User)
+model UserRole {
+  userId Int @map("user_id")
+  roleId Int @map("role_id")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("model_has_roles")
+}
+
+/// model_has_permissions (specialized to User) — direct permission grants
+model UserPermission {
+  userId       Int @map("user_id")
+  permissionId Int @map("permission_id")
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([userId, permissionId])
+  @@index([permissionId])
+  @@map("model_has_permissions")
+}
+
+/// Location access as a first-class relation (replaces `location.{id}` permissions).
+model UserLocation {
+  userId     Int @map("user_id")
+  locationId Int @map("location_id")
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  location BusinessLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@id([userId, locationId])
+  @@index([locationId])
+  @@map("user_locations")
+}
+
+/// Restricts a user to selected contacts (when users.selected_contacts = true).
+model UserContactAccess {
+  id        Int @id @default(autoincrement())
+  userId    Int @map("user_id")
+  contactId Int @map("contact_id")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([contactId])
+  @@map("user_contact_access")
+}
+
+/// Employee/user documents (id proofs, certificates). Added directly in the live DB (not in migrations).
+model UserDocument {
+  id         Int       @id @default(autoincrement())
+  userId     Int?      @map("user_id")
+  businessId Int?      @map("business_id")
+  locationId Int?      @map("location_id")
+  docName    String?   @map("doc_name") @db.VarChar(255)
+  document   String?   @db.VarChar(255)
+  docNote    String?   @map("doc_note") @db.VarChar(255)
+  status     Boolean   @default(true)
+  deletedAt  DateTime? @map("deleted_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([businessId])
+  @@map("user_documents")
+}
+
+// ===================== AUTH SESSIONS / TOKENS ==============================
+
+/// Rotating refresh tokens. Replaces Passport oauth_* + Laravel sessions.
+/// Reuse detection: replaying a revoked token revokes the whole `familyId`.
+model RefreshToken {
+  id                String    @id @default(uuid())
+  userId            Int       @map("user_id")
+  familyId          String    @map("family_id")
+  tokenHash         String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt         DateTime  @map("expires_at")
+  revokedAt         DateTime? @map("revoked_at")
+  replacedByTokenId String?   @map("replaced_by_token_id")
+  userAgent         String?   @map("user_agent") @db.Text
+  ipAddress         String?   @map("ip_address") @db.VarChar(45)
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Password reset requests (token hashed + expiry).
+model PasswordReset {
+  id        Int      @id @default(autoincrement())
+  email     String   @db.VarChar(255)
+  tokenHash String   @map("token_hash") @db.VarChar(255)
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([email])
+  @@map("password_resets")
+}
+
+/// Audit / activity log (login, logout, failed-login, mutations). Written async via BullMQ.
+model AuditLog {
+  id          BigInt   @id @default(autoincrement())
+  businessId  Int?     @map("business_id")
+  userId      Int?     @map("user_id")
+  action      String   @db.VarChar(100)
+  subjectType String?  @map("subject_type") @db.VarChar(191)
+  subjectId   Int?     @map("subject_id")
+  description String?  @db.Text
+  properties  Json?
+  ipAddress   String?  @map("ip_address") @db.VarChar(45)
+  userAgent   String?  @map("user_agent") @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  business Business? @relation(fields: [businessId], references: [id])
+  user     User?     @relation(fields: [userId], references: [id])
+
+  @@index([businessId])
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ===================== NOTIFICATIONS =======================================
+
+/// Per-business email/SMS/WhatsApp templates for transactional notifications
+/// (new_sale, payment_received, new_order, …). One row per (business, template_for).
+/// Source of truth: GOURI_DEV `notification_templates` table, verified column-by-column
+/// across its 5 migrations (create + auto_send_sms + cc/bcc + whatsapp_text/auto_send_wa_notif).
+model NotificationTemplate {
+  id              Int       @id @default(autoincrement())
+  businessId      Int       @map("business_id")
+  templateFor     String    @map("template_for") @db.VarChar(255)
+  emailBody       String?   @map("email_body") @db.Text
+  smsBody         String?   @map("sms_body") @db.Text
+  whatsappText    String?   @map("whatsapp_text") @db.Text
+  subject         String?   @db.VarChar(255)
+  cc              String?   @db.VarChar(255)
+  bcc             String?   @db.VarChar(255)
+  autoSend        Boolean   @default(false) @map("auto_send")
+  autoSendSms     Boolean   @default(false) @map("auto_send_sms")
+  autoSendWaNotif Boolean   @default(false) @map("auto_send_wa_notif")
+  createdAt       DateTime? @map("created_at")
+  updatedAt       DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, templateFor])
+  @@index([businessId])
+  @@map("notification_templates")
+}
+
+// ===================== REFERENCE COUNTERS ==================================
+
+/// Per-(business, ref_type) sequential counters that back generated reference codes
+/// (business_location ids, invoice numbers, …). Source of truth: GOURI_DEV `reference_counts`
+/// + `Util::setAndGetReferenceCount()`. Prefix/format is applied at generation time.
+model ReferenceCount {
+  id         Int       @id @default(autoincrement())
+  refType    String    @map("ref_type") @db.VarChar(255)
+  refCount   Int       @map("ref_count")
+  businessId Int       @map("business_id")
+  createdAt  DateTime? @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  @@index([businessId, refType])
+  @@map("reference_counts")
+}
+
+// ===================== INVOICE SETTINGS ====================================
+
+/// Invoice numbering scheme (prefix + running number, optionally per-year). One per business can
+/// be default. Source of truth: GOURI_DEV `invoice_schemes` + InvoiceSchemeController, verified
+/// column-by-column. `invoice_count` tracks how many invoices the scheme has generated.
+model InvoiceScheme {
+  id           Int        @id @default(autoincrement())
+  businessId   Int        @map("business_id")
+  name         String     @db.VarChar(255)
+  schemeType   SchemeType @default(BLANK) @map("scheme_type")
+  prefix       String?    @db.VarChar(255)
+  startNumber  Int?       @map("start_number")
+  invoiceCount Int        @default(0) @map("invoice_count")
+  totalDigits  Int?       @map("total_digits")
+  isDefault    Boolean    @default(false) @map("is_default")
+  createdAt    DateTime?  @map("created_at")
+  updatedAt    DateTime?  @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("invoice_schemes")
+}
+
+// ===================== CONTACTS (Suppliers / Customers) =====================
+// Source of truth: GOURI_DEV `contacts` + `customer_groups` (base migration + all
+// alters), ContactController + ContactUtil, verified column-by-column. One table
+// holds suppliers, customers, "both", and CRM "lead" rows (switched by `type`).
+//
+// NOTE: money figures shown in the legacy UI (purchase/sell due, return due,
+// opening balance, ledger) are NOT columns here — they are aggregated from the
+// `transactions` / `transaction_payments` tables (built in the transaction-core
+// module). `balance` = running advance balance; `opening_balance` is stored as a
+// `transactions` row (deferred until that module exists). See accounts-module notes.
+
+/// Supplier / customer / both / lead. Tenant-scoped, soft-deletable.
+model Contact {
+  id         Int    @id @default(autoincrement())
+  businessId Int    @map("business_id")
+  type       String @db.VarChar(191) // supplier | customer | both | lead
+
+  // --- Identity ---
+  supplierBusinessName String? @map("supplier_business_name") @db.VarChar(255)
+  name                 String? @db.VarChar(191) // full name (prefix+first+middle+last), nullable for business contacts
+  contactId            String? @map("contact_id") @db.VarChar(255) // human ref code (auto-generated if blank)
+  contactStatus        String  @default("active") @map("contact_status") @db.VarChar(255) // active | inactive
+  prefix               String? @db.VarChar(255)
+  firstName            String? @map("first_name") @db.VarChar(255)
+  middleName           String? @map("middle_name") @db.VarChar(255)
+  lastName             String? @map("last_name") @db.VarChar(255)
+  email                String? @db.VarChar(255)
+
+  // --- Tax / terms / grouping ---
+  taxNumber       String?      @map("tax_number") @db.VarChar(255)
+  customerGroupId Int?         @map("customer_group_id")
+  payTermNumber   Int?         @map("pay_term_number")
+  payTermType     PayTermType? @map("pay_term_type")
+  creditLimit     Decimal?     @map("credit_limit") @db.Decimal(22, 4)
+
+  // --- Contact numbers ---
+  mobile          String  @db.VarChar(255)
+  landline        String? @db.VarChar(255)
+  alternateNumber String? @map("alternate_number") @db.VarChar(255)
+
+  // --- Address ---
+  addressLine1 String?   @map("address_line_1") @db.Text
+  addressLine2 String?   @map("address_line_2") @db.Text
+  city         String?   @db.VarChar(255)
+  state        String?   @db.VarChar(255)
+  country      String?   @db.VarChar(255)
+  zipCode      String?   @map("zip_code") @db.VarChar(255)
+  dob          DateTime? @db.Date
+
+  // --- Custom fields ---
+  customField1  String? @map("custom_field1") @db.VarChar(255)
+  customField2  String? @map("custom_field2") @db.VarChar(255)
+  customField3  String? @map("custom_field3") @db.VarChar(255)
+  customField4  String? @map("custom_field4") @db.VarChar(255)
+  customField5  String? @map("custom_field5") @db.VarChar(255)
+  customField6  String? @map("custom_field6") @db.VarChar(255)
+  customField7  String? @map("custom_field7") @db.VarChar(255)
+  customField8  String? @map("custom_field8") @db.VarChar(255)
+  customField9  String? @map("custom_field9") @db.VarChar(255)
+  customField10 String? @map("custom_field10") @db.VarChar(255)
+
+  // --- Shipping ---
+  shippingAddress            String? @map("shipping_address") @db.Text
+  position                   String? @db.VarChar(255) // "lat,long" for map
+  shippingCustomFieldDetails Json?   @map("shipping_custom_field_details")
+
+  // --- Export ---
+  isExport           Boolean @default(false) @map("is_export")
+  exportCustomField1 String? @map("export_custom_field_1") @db.VarChar(255)
+  exportCustomField2 String? @map("export_custom_field_2") @db.VarChar(255)
+  exportCustomField3 String? @map("export_custom_field_3") @db.VarChar(255)
+  exportCustomField4 String? @map("export_custom_field_4") @db.VarChar(255)
+  exportCustomField5 String? @map("export_custom_field_5") @db.VarChar(255)
+  exportCustomField6 String? @map("export_custom_field_6") @db.VarChar(255)
+
+  // --- Flags / balances ---
+  isDefault Boolean @default(false) @map("is_default") // protects the default walk-in customer from deletion
+  balance   Decimal @default(0) @db.Decimal(22, 4) // running advance balance
+  createdBy Int     @map("created_by")
+
+  // --- Lifecycle ---
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime? @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  // --- Relations ---
+  business        Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customerGroup   CustomerGroup?      @relation(fields: [customerGroupId], references: [id])
+  usersWithAccess UserContactAccess[]
+
+  @@index([businessId])
+  @@index([type])
+  @@index([contactStatus])
+  @@index([customerGroupId])
+  // Covers the list: tenant + type filter, newest-first.
+  @@index([businessId, type, deletedAt])
+  @@map("contacts")
+}
+
+/// Customer group — applies a group-wide discount, either a flat percentage or a
+/// selling-price-group. `sellingPriceGroupId` -> selling_price_groups (Products module, later).
+model CustomerGroup {
+  id                   Int       @id @default(autoincrement())
+  businessId           Int       @map("business_id")
+  name                 String    @db.VarChar(255)
+  amount               Decimal   @db.Decimal(5, 2) // percentage value
+  priceCalculationType String    @default("percentage") @map("price_calculation_type") @db.VarChar(255) // percentage | selling_price_group
+  sellingPriceGroupId  Int?      @map("selling_price_group_id")
+  createdBy            Int       @map("created_by")
+  createdAt            DateTime? @map("created_at")
+  updatedAt            DateTime? @updatedAt @map("updated_at")
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  contacts Contact[]
+
+  @@index([businessId])
+  @@index([priceCalculationType])
+  @@index([sellingPriceGroupId])
+  @@map("customer_groups")
+}
