@@ -46,13 +46,13 @@ export class PayrollController {
   @Get(':id')
   @RequirePermissions(...VIEW)
   getPayroll(@CurrentUser() user: AccessPayload, @Param('id', ParseIntPipe) id: number) {
-    return this.payroll.getPayroll(user.businessId as number, id);
+    return this.payroll.getPayroll(user.businessId as number, id, user);
   }
 
   @Get()
   @RequirePermissions(...VIEW)
   listPayrolls(@CurrentUser() user: AccessPayload, @Query() query: PayrollQueryDto) {
-    return this.payroll.listPayrolls(user.businessId as number, query);
+    return this.payroll.listPayrolls(user.businessId as number, query, user);
   }
 
   @Post('prepare')

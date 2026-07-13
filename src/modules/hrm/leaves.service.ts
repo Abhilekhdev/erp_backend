@@ -1,13 +1,12 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { AbilityService } from '../../common/services/ability.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import type { AccessPayload } from '../auth/token.service';
 import type { ChangeLeaveStatusDto, CreateLeaveDto, SetLeaveBalancesDto } from './dto/leave.dto';
 import type { LeavesQueryDto } from './dto/leaves-query.dto';
 
-export interface Requester {
-  sub: number;
-  isBusinessAdmin: boolean;
-}
+const CRUD_ALL = 'essentials.crud_all_leave';
 
 const blank = (v?: string | null): string | null => (v == null || v === '' ? null : v);
 const fmt = (d: Date): string => d.toISOString().slice(0, 10);
@@ -23,17 +22,52 @@ const statusLabel = (s: string): string =>
 
 @Injectable()
 export class LeavesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ability: AbilityService,
+  ) {}
+
+  /**
+   * The user ids an "own-leave" (non-crud_all) user may see: themselves + every recursive subordinate
+   * (users whose `parentId` chain leads back to them). Mirrors GOURI's `managerUsers` + self scoping.
+   */
+  private async ownScopeUserIds(businessId: number, userId: number): Promise<number[]> {
+    const all = await this.prisma.user.findMany({
+      where: { businessId, deletedAt: null },
+      select: { id: true, parentId: true },
+    });
+    const childrenOf = new Map<number, number[]>();
+    for (const u of all) {
+      if (u.parentId != null) {
+        const list = childrenOf.get(u.parentId) ?? [];
+        list.push(u.id);
+        childrenOf.set(u.parentId, list);
+      }
+    }
+    const result = new Set<number>([userId]);
+    const stack = [userId];
+    while (stack.length) {
+      const cur = stack.pop() as number;
+      for (const child of childrenOf.get(cur) ?? []) {
+        if (!result.has(child)) {
+          result.add(child);
+          stack.push(child);
+        }
+      }
+    }
+    return [...result];
+  }
 
   // ── dropdowns / entitlements ───────────────────────────
-  async meta(businessId: number, requester: Requester) {
+  async meta(businessId: number, user: AccessPayload) {
+    const canAll = await this.ability.can(user, CRUD_ALL);
     const [leaveTypes, employees] = await Promise.all([
       this.prisma.leaveType.findMany({
         where: { businessId, deletedAt: null },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       }),
-      requester.isBusinessAdmin
+      canAll
         ? this.prisma.user.findMany({
             where: { businessId, userType: 'USER', deletedAt: null, isCmmsnAgnt: false },
             select: { id: true, surname: true, firstName: true, lastName: true },
@@ -49,13 +83,14 @@ export class LeavesService {
         { value: 'approved', label: 'Approved' },
         { value: 'cancelled', label: 'Rejected' },
       ],
-      canManageAll: requester.isBusinessAdmin,
+      canManageAll: canAll,
     };
   }
 
   /** Leave types the target user is entitled to (has a balance row) — the Add-Leave dropdown source. */
-  async assignableTypes(businessId: number, requester: Requester, userId?: number) {
-    const targetId = userId && requester.isBusinessAdmin ? userId : requester.sub;
+  async assignableTypes(businessId: number, user: AccessPayload, userId?: number) {
+    const canAll = await this.ability.can(user, CRUD_ALL);
+    const targetId = userId && canAll ? userId : user.sub;
     const balances = await this.prisma.userLeaveBalance.findMany({
       where: { businessId, userId: targetId },
       include: { leaveType: true },
@@ -114,12 +149,13 @@ export class LeavesService {
   }
 
   // ── leaves list / apply / status / delete ──────────────
-  async findAll(businessId: number, query: LeavesQueryDto, requester: Requester) {
-    const canAll = requester.isBusinessAdmin;
+  async findAll(businessId: number, query: LeavesQueryDto, user: AccessPayload) {
+    const canAll = await this.ability.can(user, CRUD_ALL);
     const s = query.search?.trim();
+    const ownIds = canAll ? [] : await this.ownScopeUserIds(businessId, user.sub);
     const where: Prisma.LeaveWhereInput = {
       businessId,
-      ...(canAll ? {} : { userId: requester.sub }),
+      ...(canAll ? {} : { userId: { in: ownIds } }),
       ...(query.userId && canAll ? { userId: query.userId } : {}),
       ...(query.leaveTypeId ? { leaveTypeId: query.leaveTypeId } : {}),
       ...(query.status ? { status: mapStatus(query.status) } : {}),
@@ -179,8 +215,9 @@ export class LeavesService {
     };
   }
 
-  async create(businessId: number, requester: Requester, dto: CreateLeaveDto) {
-    const targetUserId = dto.userId && requester.isBusinessAdmin ? dto.userId : requester.sub;
+  async create(businessId: number, user: AccessPayload, dto: CreateLeaveDto) {
+    const canAll = await this.ability.can(user, CRUD_ALL);
+    const targetUserId = dto.userId && canAll ? dto.userId : user.sub;
     const leaveType = await this.prisma.leaveType.findFirst({
       where: { id: dto.leaveTypeId, businessId, deletedAt: null },
     });
@@ -296,8 +333,9 @@ export class LeavesService {
     return { success: true };
   }
 
-  async summary(businessId: number, requester: Requester, userId?: number) {
-    const targetId = userId && requester.isBusinessAdmin ? userId : requester.sub;
+  async summary(businessId: number, user: AccessPayload, userId?: number) {
+    const canAll = await this.ability.can(user, CRUD_ALL);
+    const targetId = userId && canAll ? userId : user.sub;
     const [balances, leaves] = await Promise.all([
       this.prisma.userLeaveBalance.findMany({
         where: { businessId, userId: targetId },

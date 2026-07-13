@@ -16,7 +16,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../../common/decorators/require-permissions.decorator';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import type { AccessPayload } from '../auth/token.service';
-import { AttendanceService, type Requester } from './attendance.service';
+import { AttendanceService } from './attendance.service';
 import {
   AttendanceQueryDto,
   ClockDto,
@@ -32,10 +32,6 @@ const VIEW = ['essentials.view_all_attendance', 'essentials.view_own_attendance'
 export class AttendanceController {
   constructor(private readonly attendance: AttendanceService) {}
 
-  private req(user: AccessPayload): Requester {
-    return { sub: user.sub, isBusinessAdmin: user.isBusinessAdmin };
-  }
-
   @Get('meta')
   @RequirePermissions(...VIEW)
   meta(@CurrentUser() user: AccessPayload) {
@@ -45,7 +41,7 @@ export class AttendanceController {
   @Get('summary')
   @RequirePermissions(...VIEW)
   summary(@CurrentUser() user: AccessPayload, @Query() query: AttendanceQueryDto) {
-    return this.attendance.summary(user.businessId as number, query, this.req(user));
+    return this.attendance.summary(user.businessId as number, query, user);
   }
 
   @Get('clock-status')
@@ -92,11 +88,11 @@ export class AttendanceController {
   @Get()
   @RequirePermissions(...VIEW)
   findAll(@CurrentUser() user: AccessPayload, @Query() query: AttendanceQueryDto) {
-    return this.attendance.findAll(user.businessId as number, query, this.req(user));
+    return this.attendance.findAll(user.businessId as number, query, user);
   }
 
   @Post()
-  @RequirePermissions('essentials.view_all_attendance')
+  @RequirePermissions('essentials.add_attendance')
   create(@CurrentUser() user: AccessPayload, @Body() dto: CreateAttendanceDto) {
     return this.attendance.create(user.businessId as number, dto);
   }

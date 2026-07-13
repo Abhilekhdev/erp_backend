@@ -21,29 +21,27 @@ import {
   SetLeaveBalancesDto,
 } from './dto/leave.dto';
 import { LeavesQueryDto } from './dto/leaves-query.dto';
-import { LeavesService, type Requester } from './leaves.service';
+import { LeavesService } from './leaves.service';
 
 const LEAVE_ACCESS = ['essentials.crud_all_leave', 'essentials.crud_own_leave'] as const;
+// GOURI lets HR (crud_all) or a dedicated approver (approve_leave) act on leave status.
+const LEAVE_APPROVE = ['essentials.approve_leave', 'essentials.crud_all_leave'] as const;
 
 @Controller('hrm/leaves')
 @UseGuards(PermissionsGuard)
 export class LeavesController {
   constructor(private readonly leaves: LeavesService) {}
 
-  private req(user: AccessPayload): Requester {
-    return { sub: user.sub, isBusinessAdmin: user.isBusinessAdmin };
-  }
-
   @Get()
   @RequirePermissions(...LEAVE_ACCESS)
   findAll(@CurrentUser() user: AccessPayload, @Query() query: LeavesQueryDto) {
-    return this.leaves.findAll(user.businessId as number, query, this.req(user));
+    return this.leaves.findAll(user.businessId as number, query, user);
   }
 
   @Get('meta')
   @RequirePermissions(...LEAVE_ACCESS)
   meta(@CurrentUser() user: AccessPayload) {
-    return this.leaves.meta(user.businessId as number, this.req(user));
+    return this.leaves.meta(user.businessId as number, user);
   }
 
   @Get('assignable')
@@ -51,7 +49,7 @@ export class LeavesController {
   assignable(@CurrentUser() user: AccessPayload, @Query('userId') userId?: string) {
     return this.leaves.assignableTypes(
       user.businessId as number,
-      this.req(user),
+      user,
       userId ? Number(userId) : undefined,
     );
   }
@@ -61,7 +59,7 @@ export class LeavesController {
   summary(@CurrentUser() user: AccessPayload, @Query('userId') userId?: string) {
     return this.leaves.summary(
       user.businessId as number,
-      this.req(user),
+      user,
       userId ? Number(userId) : undefined,
     );
   }
@@ -85,11 +83,11 @@ export class LeavesController {
   @Post()
   @RequirePermissions(...LEAVE_ACCESS)
   create(@CurrentUser() user: AccessPayload, @Body() dto: CreateLeaveDto) {
-    return this.leaves.create(user.businessId as number, this.req(user), dto);
+    return this.leaves.create(user.businessId as number, user, dto);
   }
 
   @Post(':id/status')
-  @RequirePermissions('essentials.approve_leave')
+  @RequirePermissions(...LEAVE_APPROVE)
   changeStatus(
     @CurrentUser() user: AccessPayload,
     @Param('id', ParseIntPipe) id: number,

@@ -11,6 +11,12 @@ export interface AccessPayload {
   userType: string;
   isBusinessAdmin: boolean;
   roles: string[];
+  /**
+   * The user's resolved permission names. NOT carried in the JWT (kept lean + always live) — the
+   * PermissionsGuard loads them per request and stamps them here so downstream services can make
+   * fine-grained "all vs own" decisions (e.g. view_all_attendance) instead of proxying isBusinessAdmin.
+   */
+  permissions?: string[];
 }
 
 interface SessionMeta {

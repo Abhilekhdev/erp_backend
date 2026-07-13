@@ -5,6 +5,7 @@ import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { ClsModule } from 'nestjs-cls';
 
 import { validateEnv, type Env } from './config/env.validation';
+import { CommonModule } from './common/common.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { PrismaModule } from './infra/prisma/prisma.module';
@@ -42,6 +43,7 @@ import { UsersModule } from './modules/users/users.module';
       ],
     }),
     PrismaModule,
+    CommonModule,
     AuthModule,
     PermissionsModule,
     RolesModule,

@@ -1,19 +1,22 @@
 import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { PrismaService } from '../../infra/prisma/prisma.service';
 import { PERMISSIONS_KEY } from '../decorators/require-permissions.decorator';
+import { AbilityService } from '../services/ability.service';
 import type { AccessPayload } from '../../modules/auth/token.service';
 
 /**
  * Enforces @RequirePermissions. Mirrors Laravel's `Gate::before`: a tenant Admin
  * (`isBusinessAdmin`) passes every check; everyone else must hold at least one of the
  * required permissions (resolved from their roles + direct grants).
+ *
+ * On top of enforcement, it stamps the resolved permission set onto `request.user.permissions`
+ * so downstream services can make fine-grained "all vs own" decisions without re-querying.
  */
 @Injectable()
 export class PermissionsGuard implements CanActivate {
   constructor(
     private readonly reflector: Reflector,
-    private readonly prisma: PrismaService,
+    private readonly ability: AbilityService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -27,24 +30,11 @@ export class PermissionsGuard implements CanActivate {
     if (!user) throw new ForbiddenException('Not authenticated');
     if (user.isBusinessAdmin) return true;
 
-    const perms = await this.loadPermissions(user.sub);
+    const perms = await this.ability.loadPermissions(user.sub);
+    user.permissions = [...perms]; // stamp for downstream services (fine-grained scoping)
     if (!required.some((p) => perms.has(p))) {
       throw new ForbiddenException('You do not have permission to perform this action');
     }
     return true;
-  }
-
-  private async loadPermissions(userId: number): Promise<Set<string>> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      include: {
-        roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } },
-        permissions: { include: { permission: true } },
-      },
-    });
-    const set = new Set<string>();
-    user?.roles.forEach((r) => r.role.permissions.forEach((rp) => set.add(rp.permission.name)));
-    user?.permissions.forEach((up) => set.add(up.permission.name));
-    return set;
   }
 }

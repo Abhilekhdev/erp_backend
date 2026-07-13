@@ -1,6 +1,8 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { AbilityService } from '../../common/services/ability.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import type { AccessPayload } from '../auth/token.service';
 import type {
   AttendanceQueryDto,
   ClockDto,
@@ -8,10 +10,7 @@ import type {
   UpdateAttendanceDto,
 } from './dto/attendance.dto';
 
-export interface Requester {
-  sub: number;
-  isBusinessAdmin: boolean;
-}
+const VIEW_ALL = 'essentials.view_all_attendance';
 
 const blank = (v?: string | null): string | null => (v == null || v === '' ? null : v);
 const fmtDate = (d: Date): string => d.toISOString().slice(0, 10);
@@ -27,7 +26,10 @@ const workDuration = (start: Date, end: Date | null) => {
 
 @Injectable()
 export class AttendanceService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ability: AbilityService,
+  ) {}
 
   async meta(businessId: number) {
     const [employees, activityCodes, shifts] = await Promise.all([
@@ -62,11 +64,11 @@ export class AttendanceService {
     return new Map(codes.map((c) => [c.id, c.activityCode || c.activityName]));
   }
 
-  async findAll(businessId: number, query: AttendanceQueryDto, requester: Requester) {
-    const canAll = requester.isBusinessAdmin;
+  async findAll(businessId: number, query: AttendanceQueryDto, user: AccessPayload) {
+    const canAll = await this.ability.can(user, VIEW_ALL);
     const where: Prisma.AttendanceWhereInput = {
       businessId,
-      ...(canAll ? {} : { userId: requester.sub }),
+      ...(canAll ? {} : { userId: user.sub }),
       ...(query.employeeId && canAll ? { userId: query.employeeId } : {}),
       ...(query.activityCodeId ? { activityCodeId: query.activityCodeId } : {}),
       ...(query.startDate && query.endDate
@@ -108,12 +110,12 @@ export class AttendanceService {
     return { data, total, canManageAll: canAll };
   }
 
-  async summary(businessId: number, query: AttendanceQueryDto, requester: Requester) {
-    const canAll = requester.isBusinessAdmin;
+  async summary(businessId: number, query: AttendanceQueryDto, user: AccessPayload) {
+    const canAll = await this.ability.can(user, VIEW_ALL);
     const where: Prisma.AttendanceWhereInput = {
       businessId,
       clockOutTime: { not: null },
-      ...(canAll ? {} : { userId: requester.sub }),
+      ...(canAll ? {} : { userId: user.sub }),
       ...(query.employeeId && canAll ? { userId: query.employeeId } : {}),
       ...(query.startDate && query.endDate
         ? {

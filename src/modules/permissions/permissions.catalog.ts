@@ -511,6 +511,10 @@ export const PERMISSION_CATALOG: PermGroup[] = [
       cb('essentials.add_holiday', 'Add holiday'),
       cb('essentials.edit_holiday', 'Edit holiday'),
       cb('essentials.delete_holiday', 'Delete holiday'),
+      cb('essentials.activity_log', 'Manage activity codes'),
+      // NOTE: intentionally un-prefixed — matches GOURI's literal `edit_essentials_settings` and the
+      // string already used by the HRM Settings route + the frontend HRM tab gate.
+      cb('edit_essentials_settings', 'Edit HRM settings'),
     ],
   },
   {

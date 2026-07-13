@@ -46,17 +46,6 @@ const DEFAULT_ENABLED_MODULES = [
   'expenses',
 ];
 
-// The default POS-staff role every new business ships with (mirrors BusinessUtil::createDefaultBusinessRoles).
-const CASHIER_PERMISSIONS = [
-  'sell.view',
-  'sell.create',
-  'sell.update',
-  'sell.delete',
-  'access_all_locations',
-  'view_cash_register',
-  'close_cash_register',
-];
-
 @Injectable()
 export class AuthService {
   constructor(
@@ -113,29 +102,6 @@ export class AuthService {
         data: { name: 'Admin', businessId: business.id, isDefault: true },
       });
       await tx.userRole.create({ data: { userId: owner.id, roleId: adminRole.id } });
-
-      // Cashier = the ready-to-assign POS-staff role every new business ships with. Its permissions
-      // are seeded; create any that are missing, then link them — kept to a few round-trips so the
-      // interactive transaction stays well within its timeout on serverless Postgres.
-      const cashierRole = await tx.role.create({
-        data: { name: 'Cashier', businessId: business.id, isDefault: true },
-      });
-      const seeded = await tx.permission.findMany({
-        where: { name: { in: CASHIER_PERMISSIONS } },
-        select: { name: true },
-      });
-      const missing = CASHIER_PERMISSIONS.filter((n) => !seeded.some((p) => p.name === n));
-      if (missing.length) {
-        await tx.permission.createMany({ data: missing.map((name) => ({ name })), skipDuplicates: true });
-      }
-      const cashierPerms = await tx.permission.findMany({
-        where: { name: { in: CASHIER_PERMISSIONS } },
-        select: { id: true },
-      });
-      await tx.rolePermission.createMany({
-        data: cashierPerms.map((p) => ({ roleId: cashierRole.id, permissionId: p.id })),
-        skipDuplicates: true,
-      });
 
       return owner.id;
     }, { timeout: 20000, maxWait: 15000 });

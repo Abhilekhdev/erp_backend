@@ -1,7 +1,11 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { AbilityService } from '../../common/services/ability.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import type { AccessPayload } from '../auth/token.service';
 import type { GeneratePayrollDto, PayrollQueryDto, PreparePayrollDto } from './dto/payroll.dto';
+
+const VIEW_ALL = 'essentials.view_all_payroll';
 
 const fullName = (u: { surname: string | null; firstName: string; lastName: string | null }): string =>
   [u.surname, u.firstName, u.lastName].filter(Boolean).join(' ').trim();
@@ -12,7 +16,10 @@ const monthLabel = (d: Date): string =>
 
 @Injectable()
 export class PayrollService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ability: AbilityService,
+  ) {}
 
   async meta(businessId: number) {
     const [employees, locations, departments, designations] = await Promise.all([
@@ -150,11 +157,14 @@ export class PayrollService {
     return this.getGroup(businessId, groupId);
   }
 
-  async listPayrolls(businessId: number, query: PayrollQueryDto) {
+  async listPayrolls(businessId: number, query: PayrollQueryDto, user: AccessPayload) {
     const s = query.search.trim();
+    // Without view_all_payroll a user only sees their OWN payslips (GOURI: where expense_for = self).
+    const canAll = await this.ability.can(user, VIEW_ALL);
     const where: Prisma.PayrollWhereInput = {
       businessId,
-      ...(query.employeeId ? { userId: query.employeeId } : {}),
+      ...(canAll ? {} : { userId: user.sub }),
+      ...(query.employeeId && canAll ? { userId: query.employeeId } : {}),
       ...(query.month ? { month: monthDate(query.month) } : {}),
       ...(query.departmentId ? { user: { essentialsDepartmentId: query.departmentId } } : {}),
       ...(query.designationId ? { user: { essentialsDesignationId: query.designationId } } : {}),
@@ -238,12 +248,16 @@ export class PayrollService {
     };
   }
 
-  async getPayroll(businessId: number, id: number) {
+  async getPayroll(businessId: number, id: number, user: AccessPayload) {
     const p = await this.prisma.payroll.findFirst({
       where: { id, businessId },
       include: { user: true, lines: true },
     });
     if (!p) throw new NotFoundException('Payroll not found');
+    // A user without view_all_payroll may only open their own payslip.
+    if (p.userId !== user.sub && !(await this.ability.can(user, VIEW_ALL))) {
+      throw new NotFoundException('Payroll not found');
+    }
     return this.shapePayroll(p);
   }
 
