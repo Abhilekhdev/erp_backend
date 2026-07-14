@@ -301,6 +301,14 @@ model Business {
   invoiceSchemes        InvoiceScheme[]
   contacts              Contact[]
   customerGroups        CustomerGroup[]
+  units                 Unit[]
+  categories            Category[]
+  brands                Brand[]
+  taxRates              TaxRate[]
+  variationTemplates    VariationTemplate[]
+  warranties            Warranty[]
+  sellingPriceGroups    SellingPriceGroup[]
+  products              Product[]
 
   @@index([currencyId])
   @@index([ownerId])
@@ -1186,4 +1194,281 @@ model CustomerGroup {
   @@index([priceCalculationType])
   @@index([sellingPriceGroupId])
   @@map("customer_groups")
+}
+
+/// Units of measure (GOURI `units`). A "base unit" has baseUnitId=null; a "sub-unit" points at its
+/// base via baseUnitId + baseUnitMultiplier (e.g. 1 Box = 12 Pcs → Box.baseUnitId=Pcs, multiplier=12).
+model Unit {
+  id                 Int       @id @default(autoincrement())
+  businessId         Int       @map("business_id")
+  actualName         String    @map("actual_name") @db.VarChar(255)
+  shortName          String    @map("short_name") @db.VarChar(255)
+  allowDecimal       Boolean   @default(false) @map("allow_decimal")
+  baseUnitId         Int?      @map("base_unit_id")
+  baseUnitMultiplier Decimal?  @map("base_unit_multiplier") @db.Decimal(20, 4)
+  createdBy          Int       @map("created_by")
+  deletedAt          DateTime? @map("deleted_at")
+  createdAt          DateTime? @default(now()) @map("created_at")
+  updatedAt          DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  baseUnit Unit?    @relation("UnitSubUnits", fields: [baseUnitId], references: [id])
+  subUnits Unit[]   @relation("UnitSubUnits")
+
+  @@index([businessId])
+  @@index([baseUnitId])
+  @@map("units")
+}
+
+/// Product categories (GOURI `categories` via TaxonomyController ?type=product). Two levels:
+/// a top-level category has parentId=null; a sub-category points at its parent via parentId.
+/// (GOURI uses a `parent_id=0` sentinel for top-level — ported here as a nullable self-relation.)
+model Category {
+  id           Int       @id @default(autoincrement())
+  businessId   Int       @map("business_id")
+  name         String    @db.VarChar(255)
+  shortCode    String?   @map("short_code") @db.VarChar(255)
+  parentId     Int?      @map("parent_id")
+  categoryType String    @default("product") @map("category_type") @db.VarChar(255)
+  description  String?   @db.Text
+  createdBy    Int       @map("created_by")
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime? @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  business      Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  parent        Category?  @relation("CategorySubs", fields: [parentId], references: [id])
+  subCategories Category[] @relation("CategorySubs")
+
+  @@index([businessId])
+  @@index([parentId])
+  @@index([categoryType])
+  @@map("categories")
+}
+
+/// Product brands (GOURI `brands`). `useForRepair` is only written when the Repair module is installed.
+model Brand {
+  id           Int       @id @default(autoincrement())
+  businessId   Int       @map("business_id")
+  name         String    @db.VarChar(255)
+  description  String?   @db.Text
+  useForRepair Boolean?  @default(false) @map("use_for_repair")
+  createdBy    Int       @map("created_by")
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime? @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("brands")
+}
+
+/// Tax rates AND tax groups share one table (GOURI `tax_rates`). `isTaxGroup` distinguishes them; a
+/// group's `amount` is the sum of its member rates' amounts. `forTaxGroup` marks a simple rate as
+/// usable only inside groups (hidden from normal product-tax dropdowns).
+model TaxRate {
+  id          Int       @id @default(autoincrement())
+  businessId  Int       @map("business_id")
+  name        String    @db.VarChar(255)
+  amount      Decimal   @db.Decimal(22, 4)
+  isTaxGroup  Boolean   @default(false) @map("is_tax_group")
+  forTaxGroup Boolean   @default(false) @map("for_tax_group")
+  createdBy   Int       @map("created_by")
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime? @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  business Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  members  GroupSubTax[] @relation("GroupMembers") // rows where this rate IS the group
+  memberOf GroupSubTax[] @relation("MemberGroups") // rows where this rate is a member of a group
+
+  @@index([businessId])
+  @@map("tax_rates")
+}
+
+/// Membership pivot linking a tax group to its member simple rates (GOURI `group_sub_taxes`).
+model GroupSubTax {
+  groupTaxId Int @map("group_tax_id")
+  taxId      Int @map("tax_id")
+
+  group  TaxRate @relation("GroupMembers", fields: [groupTaxId], references: [id], onDelete: Cascade)
+  member TaxRate @relation("MemberGroups", fields: [taxId], references: [id], onDelete: Cascade)
+
+  @@id([groupTaxId, taxId])
+  @@index([groupTaxId])
+  @@index([taxId])
+  @@map("group_sub_taxes")
+}
+
+/// Reusable attribute set for variable products (GOURI `variation_templates`), e.g. "Colour". No soft-delete.
+model VariationTemplate {
+  id         Int       @id @default(autoincrement())
+  businessId Int       @map("business_id")
+  name       String    @db.VarChar(255)
+  createdAt  DateTime? @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  business Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  values   VariationValueTemplate[]
+
+  @@index([businessId])
+  @@map("variation_templates")
+}
+
+/// The allowed values of a variation template (GOURI `variation_value_templates`), e.g. "Red","Blue".
+model VariationValueTemplate {
+  id                  Int       @id @default(autoincrement())
+  name                String    @db.VarChar(255)
+  variationTemplateId Int       @map("variation_template_id")
+  createdAt           DateTime? @default(now()) @map("created_at")
+  updatedAt           DateTime? @updatedAt @map("updated_at")
+
+  template VariationTemplate @relation(fields: [variationTemplateId], references: [id], onDelete: Cascade)
+
+  @@index([variationTemplateId])
+  @@map("variation_value_templates")
+}
+
+/// Product warranties (GOURI `warranties`). No soft-delete.
+model Warranty {
+  id           Int       @id @default(autoincrement())
+  businessId   Int       @map("business_id")
+  name         String    @db.VarChar(255)
+  description  String?   @db.Text
+  duration     Int
+  durationType String    @map("duration_type") @db.VarChar(255) // days | months | years
+  createdAt    DateTime? @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("warranties")
+}
+
+/// Named price tiers (GOURI `selling_price_groups`). Per-variation prices live in variation_group_prices
+/// (added with the Products module). Each group also mints a dynamic `selling_price_group.{id}` permission.
+model SellingPriceGroup {
+  id          Int       @id @default(autoincrement())
+  businessId  Int       @map("business_id")
+  name        String    @db.VarChar(255)
+  description String?   @db.Text
+  isActive    Boolean   @default(true) @map("is_active")
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime? @default(now()) @map("created_at")
+  updatedAt   DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("selling_price_groups")
+}
+
+/// Products (GOURI `products`). No soft-delete — deactivate via `isInactive`; hard-delete only when
+/// nothing references it. FK-like columns (unitId/brandId/categoryId/tax/warrantyId) are plain ints
+/// validated in the service (GOURI has no DB FKs on most of them), matching the legacy schema.
+model Product {
+  id                       Int       @id @default(autoincrement())
+  businessId               Int       @map("business_id")
+  name                     String    @db.VarChar(255)
+  type                     String?   @db.VarChar(50) // single | variable | combo
+  unitId                   Int?      @map("unit_id")
+  secondaryUnitId          Int?      @map("secondary_unit_id")
+  subUnitIds               Json?     @map("sub_unit_ids")
+  brandId                  Int?      @map("brand_id")
+  categoryId               Int?      @map("category_id")
+  subCategoryId            Int?      @map("sub_category_id")
+  taxRateId                Int?      @map("tax") // GOURI column is literally named `tax` (a tax_rates id)
+  taxType                  String    @default("exclusive") @map("tax_type") @db.VarChar(50)
+  enableStock              Boolean   @default(false) @map("enable_stock")
+  alertQuantity            Decimal?  @map("alert_quantity") @db.Decimal(22, 4)
+  sku                      String    @db.VarChar(255)
+  barcodeType              String    @default("C128") @map("barcode_type") @db.VarChar(50)
+  expiryPeriod             Decimal?  @map("expiry_period") @db.Decimal(8, 2)
+  expiryPeriodType         String?   @map("expiry_period_type") @db.VarChar(50)
+  enableSrNo               Boolean   @default(false) @map("enable_sr_no")
+  weight                   String?   @db.VarChar(255)
+  productCustomField1      String?   @map("product_custom_field1") @db.VarChar(255)
+  productCustomField2      String?   @map("product_custom_field2") @db.VarChar(255)
+  productCustomField3      String?   @map("product_custom_field3") @db.VarChar(255)
+  productCustomField4      String?   @map("product_custom_field4") @db.VarChar(255)
+  image                    String?   @db.VarChar(255)
+  productDescription       String?   @map("product_description") @db.Text
+  createdBy                Int       @map("created_by")
+  warrantyId               Int?      @map("warranty_id")
+  isInactive               Boolean   @default(false) @map("is_inactive")
+  notForSelling            Boolean   @default(false) @map("not_for_selling")
+  preparationTimeInMinutes Int?      @map("preparation_time_in_minutes")
+  createdAt                DateTime? @default(now()) @map("created_at")
+  updatedAt                DateTime? @updatedAt @map("updated_at")
+
+  business          Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  variations        Variation[]
+  productVariations ProductVariation[]
+
+  @@index([businessId])
+  @@index([type])
+  @@map("products")
+}
+
+/// One per attribute of a product (GOURI `product_variations`). `isDummy`=true for single/combo,
+/// false for a variable product's attribute (e.g. "Colour").
+model ProductVariation {
+  id                  Int       @id @default(autoincrement())
+  productId           Int       @map("product_id")
+  variationTemplateId Int?      @map("variation_template_id")
+  name                String    @db.VarChar(255)
+  isDummy             Boolean   @default(true) @map("is_dummy")
+  createdAt           DateTime? @default(now()) @map("created_at")
+  updatedAt           DateTime? @updatedAt @map("updated_at")
+
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variations Variation[]
+
+  @@index([productId])
+  @@map("product_variations")
+}
+
+/// The sellable/priced rows (GOURI `variations`). SoftDeletes. name='DUMMY' for single/combo.
+model Variation {
+  id                   Int       @id @default(autoincrement())
+  name                 String    @default("DUMMY") @db.VarChar(255)
+  productId            Int       @map("product_id")
+  subSku               String?   @map("sub_sku") @db.VarChar(255)
+  productVariationId   Int       @map("product_variation_id")
+  variationValueId     Int?      @map("variation_value_id")
+  defaultPurchasePrice Decimal?  @map("default_purchase_price") @db.Decimal(22, 4)
+  dppIncTax            Decimal   @default(0) @map("dpp_inc_tax") @db.Decimal(22, 4)
+  profitPercent        Decimal   @default(0) @map("profit_percent") @db.Decimal(22, 4)
+  defaultSellPrice     Decimal?  @map("default_sell_price") @db.Decimal(22, 4)
+  sellPriceIncTax      Decimal?  @map("sell_price_inc_tax") @db.Decimal(22, 4)
+  comboVariations      Json?     @map("combo_variations") // [{variation_id, quantity, unit_id}] for combo
+  deletedAt            DateTime? @map("deleted_at")
+  createdAt            DateTime? @default(now()) @map("created_at")
+  updatedAt            DateTime? @updatedAt @map("updated_at")
+
+  product          Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productVariation ProductVariation      @relation(fields: [productVariationId], references: [id], onDelete: Cascade)
+  groupPrices      VariationGroupPrice[]
+
+  @@index([productId])
+  @@index([productVariationId])
+  @@map("variations")
+}
+
+/// Per-variation price for a selling-price group (GOURI `variation_group_prices`). No soft-delete.
+model VariationGroupPrice {
+  id           Int       @id @default(autoincrement())
+  variationId  Int       @map("variation_id")
+  priceGroupId Int       @map("price_group_id")
+  priceIncTax  Decimal   @map("price_inc_tax") @db.Decimal(22, 4)
+  createdAt    DateTime? @default(now()) @map("created_at")
+  updatedAt    DateTime? @updatedAt @map("updated_at")
+
+  variation Variation @relation(fields: [variationId], references: [id], onDelete: Cascade)
+
+  @@index([variationId])
+  @@index([priceGroupId])
+  @@map("variation_group_prices")
 }

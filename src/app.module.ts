@@ -11,7 +11,9 @@ import { ResponseInterceptor } from './common/interceptors/response.interceptor'
 import { PrismaModule } from './infra/prisma/prisma.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { BusinessLocationsModule } from './modules/business-locations/business-locations.module';
+import { BrandsModule } from './modules/brands/brands.module';
 import { BusinessSettingsModule } from './modules/business-settings/business-settings.module';
+import { CategoriesModule } from './modules/categories/categories.module';
 import { CommissionAgentsModule } from './modules/commission-agents/commission-agents.module';
 import { ContactsModule } from './modules/contacts/contacts.module';
 import { CustomerGroupsModule } from './modules/customer-groups/customer-groups.module';
@@ -20,7 +22,13 @@ import { HrmModule } from './modules/hrm/hrm.module';
 import { InvoiceSchemesModule } from './modules/invoice-schemes/invoice-schemes.module';
 import { NotificationTemplatesModule } from './modules/notification-templates/notification-templates.module';
 import { PermissionsModule } from './modules/permissions/permissions.module';
+import { ProductsModule } from './modules/products/products.module';
 import { RolesModule } from './modules/roles/roles.module';
+import { SellingPriceGroupsModule } from './modules/selling-price-groups/selling-price-groups.module';
+import { TaxRatesModule } from './modules/tax-rates/tax-rates.module';
+import { UnitsModule } from './modules/units/units.module';
+import { VariationTemplatesModule } from './modules/variation-templates/variation-templates.module';
+import { WarrantiesModule } from './modules/warranties/warranties.module';
 import { UsersModule } from './modules/users/users.module';
 
 @Module({
@@ -56,6 +64,14 @@ import { UsersModule } from './modules/users/users.module';
     InvoiceSchemesModule,
     NotificationTemplatesModule,
     HrmModule,
+    UnitsModule,
+    CategoriesModule,
+    BrandsModule,
+    TaxRatesModule,
+    VariationTemplatesModule,
+    WarrantiesModule,
+    SellingPriceGroupsModule,
+    ProductsModule,
     HealthModule,
   ],
   providers: [
