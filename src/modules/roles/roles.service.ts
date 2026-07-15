@@ -4,11 +4,14 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { OWNER_ROLE } from '../../common/constants/roles';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import type { CreateRoleDto } from './dto/create-role.dto';
 import type { UpdateRoleDto } from './dto/update-role.dto';
 
-const RESERVED_NAMES = ['Admin']; // Admin is the Gate::before wildcard — cannot be created/edited/deleted
+// The owner's Super Admin role is the Gate::before wildcard — it cannot be created/edited/deleted.
+// ("Admin" is deliberately NOT reserved: it may be created as an ordinary, permission-scoped role.)
+const RESERVED_NAMES = [OWNER_ROLE];
 
 @Injectable()
 export class RolesService {
@@ -42,7 +45,7 @@ export class RolesService {
       name: r.name,
       isDefault: r.isDefault,
       isServiceStaff: r.isServiceStaff,
-      isAdmin: r.name === 'Admin',
+      isAdmin: r.name === OWNER_ROLE,
       userCount: r._count.users,
       permissionCount: r._count.permissions,
       mutable: this.isMutable(r),
@@ -61,7 +64,7 @@ export class RolesService {
       name: role.name,
       isDefault: role.isDefault,
       isServiceStaff: role.isServiceStaff,
-      isAdmin: role.name === 'Admin',
+      isAdmin: role.name === OWNER_ROLE,
       mutable: this.isMutable(role),
       permissions: role.permissions.map((rp) => rp.permission.name),
     };
@@ -86,7 +89,7 @@ export class RolesService {
   async update(businessId: number, id: number, dto: UpdateRoleDto) {
     const role = await this.prisma.role.findFirst({ where: { id, businessId } });
     if (!role) throw new NotFoundException('Role not found');
-    if (role.name === 'Admin') throw new ForbiddenException('The Admin role cannot be edited');
+    if (role.name === OWNER_ROLE) throw new ForbiddenException(`The ${OWNER_ROLE} role cannot be edited`);
     if (!this.isMutable(role)) throw new ForbiddenException('This default role cannot be edited');
 
     if (dto.name && dto.name !== role.name) {
@@ -116,7 +119,7 @@ export class RolesService {
       include: { _count: { select: { users: true } } },
     });
     if (!role) throw new NotFoundException('Role not found');
-    if (role.name === 'Admin') throw new ForbiddenException('The Admin role cannot be deleted');
+    if (role.name === OWNER_ROLE) throw new ForbiddenException(`The ${OWNER_ROLE} role cannot be deleted`);
     if (!this.isMutable(role)) throw new ForbiddenException('This default role cannot be deleted');
     if (role._count.users > 0) {
       throw new ConflictException('This role is assigned to users and cannot be deleted');

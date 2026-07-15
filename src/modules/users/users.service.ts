@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
+import { OWNER_ROLE } from '../../common/constants/roles';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import { PasswordService } from '../auth/password.service';
 import type { CreateUserDto } from './dto/create-user.dto';
@@ -68,17 +69,30 @@ export class UsersService {
       allowLogin: u.allowLogin,
       status: u.status.toLowerCase(),
       role: u.roles[0]?.role.name ?? '—',
-      isAdmin: u.roles[0]?.role.name === 'Admin',
+      isAdmin: u.roles[0]?.role.name === OWNER_ROLE,
     }));
     return { data, total };
   }
 
-  async meta(businessId: number, isAdmin: boolean) {
+  /**
+   * Form dropdowns. The **Admin** role is reserved for the business owner — it is never offered when
+   * creating a user or editing anyone else, otherwise an employee would inherit the Gate::before
+   * wildcard (every permission). It is only included when editing the user who already holds it, so
+   * their own form still shows their current role.
+   */
+  async meta(businessId: number, forUserId?: number) {
+    let includeAdmin = false;
+    if (forUserId) {
+      const target = await this.prisma.user.findFirst({
+        where: { id: forUserId, businessId, deletedAt: null },
+        include: { roles: { include: { role: true } } },
+      });
+      includeAdmin = target?.roles[0]?.role.name === OWNER_ROLE;
+    }
     const [roles, locations, managers, departments, designations, activityCodes, payComponents, leaveTypes] =
       await this.prisma.$transaction([
         this.prisma.role.findMany({
-          // Non-admins cannot assign the Admin role (mirrors ManageUserController::getRolesArray).
-          where: { businessId, ...(isAdmin ? {} : { name: { not: 'Admin' } }) },
+          where: { businessId, ...(includeAdmin ? {} : { name: { not: OWNER_ROLE } }) },
           select: { id: true, name: true },
           orderBy: { name: 'asc' },
         }),
@@ -214,6 +228,11 @@ export class UsersService {
     await this.assertUnique(dto.email, dto.username);
     const role = await this.prisma.role.findFirst({ where: { id: dto.roleId, businessId } });
     if (!role) throw new BadRequestException('Selected role is invalid');
+    // The Admin role belongs to the business owner alone — it grants every permission via the
+    // Gate::before wildcard, so it must never be handed to another user.
+    if (role.name === OWNER_ROLE) {
+      throw new BadRequestException(`The ${OWNER_ROLE} role is reserved for the business owner and cannot be assigned`);
+    }
     await this.assertHrmRefs(businessId, dto);
 
     const allowLogin = dto.allowLogin ?? true;
@@ -303,18 +322,22 @@ export class UsersService {
     if (dto.username && dto.username !== user.username) await this.assertUniqueUsername(dto.username, id);
     await this.assertHrmRefs(businessId, dto);
 
-    // Role change — cannot strip the last Admin's Admin role.
+    // Role change — cannot strip the last Admin's Admin role, and nobody can be promoted INTO Admin
+    // (it is the owner's wildcard role).
     if (dto.roleId !== undefined && dto.roleId !== user.roles[0]?.roleId) {
       const newRole = await this.prisma.role.findFirst({ where: { id: dto.roleId, businessId } });
       if (!newRole) throw new BadRequestException('Selected role is invalid');
-      const wasAdmin = user.roles[0]?.role.name === 'Admin';
-      if (wasAdmin && newRole.name !== 'Admin') {
-        const adminRole = await this.prisma.role.findFirst({ where: { businessId, name: 'Admin' } });
+      if (newRole.name === OWNER_ROLE) {
+        throw new BadRequestException(`The ${OWNER_ROLE} role is reserved for the business owner and cannot be assigned`);
+      }
+      const wasAdmin = user.roles[0]?.role.name === OWNER_ROLE;
+      if (wasAdmin && newRole.name !== OWNER_ROLE) {
+        const adminRole = await this.prisma.role.findFirst({ where: { businessId, name: OWNER_ROLE } });
         const adminCount = adminRole
           ? await this.prisma.userRole.count({ where: { roleId: adminRole.id } })
           : 0;
         if (adminCount <= 1) {
-          throw new ForbiddenException('Cannot change the role of the only administrator');
+          throw new ForbiddenException(`Cannot change the role of the only ${OWNER_ROLE}`);
         }
       }
     }
@@ -368,12 +391,12 @@ export class UsersService {
     });
     if (!user) throw new NotFoundException('User not found');
 
-    if (user.roles[0]?.role.name === 'Admin') {
-      const adminRole = await this.prisma.role.findFirst({ where: { businessId, name: 'Admin' } });
+    if (user.roles[0]?.role.name === OWNER_ROLE) {
+      const adminRole = await this.prisma.role.findFirst({ where: { businessId, name: OWNER_ROLE } });
       const adminCount = adminRole
         ? await this.prisma.userRole.count({ where: { roleId: adminRole.id } })
         : 0;
-      if (adminCount <= 1) throw new ForbiddenException('Cannot delete the only administrator');
+      if (adminCount <= 1) throw new ForbiddenException(`Cannot delete the only ${OWNER_ROLE}`);
     }
 
     await this.prisma.user.update({ where: { id }, data: { deletedAt: new Date() } });

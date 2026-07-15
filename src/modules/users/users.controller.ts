@@ -32,10 +32,11 @@ export class UsersController {
   }
 
   // Must be declared before ':id' so "meta" is not captured as an id param.
+  // `userId` = the user being edited; it only makes the owner's own Admin role visible on their form.
   @Get('meta')
   @RequirePermissions('user.view', 'user.create', 'user.update')
-  meta(@CurrentUser() user: AccessPayload) {
-    return this.users.meta(user.businessId as number, user.isBusinessAdmin);
+  meta(@CurrentUser() user: AccessPayload, @Query('userId') userId?: string) {
+    return this.users.meta(user.businessId as number, userId ? Number(userId) : undefined);
   }
 
   @Get(':id')

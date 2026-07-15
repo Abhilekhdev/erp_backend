@@ -5,6 +5,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { OWNER_ROLE } from '../../common/constants/roles';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import { PasswordService } from './password.service';
 import type { AccessPayload } from './token.service';
@@ -97,11 +98,11 @@ export class AuthService {
 
       await tx.user.update({ where: { id: owner.id }, data: { businessId: business.id } });
 
-      // Tenant Admin role = the Gate::before wildcard. No explicit permissions attached.
-      const adminRole = await tx.role.create({
-        data: { name: 'Admin', businessId: business.id, isDefault: true },
+      // The owner's Super Admin role = the Gate::before wildcard. No explicit permissions attached.
+      const ownerRole = await tx.role.create({
+        data: { name: OWNER_ROLE, businessId: business.id, isDefault: true },
       });
-      await tx.userRole.create({ data: { userId: owner.id, roleId: adminRole.id } });
+      await tx.userRole.create({ data: { userId: owner.id, roleId: ownerRole.id } });
 
       return owner.id;
     }, { timeout: 20000, maxWait: 15000 });
@@ -137,7 +138,7 @@ export class AuthService {
       sub: user.id,
       businessId: user.businessId,
       userType: user.userType.toLowerCase(),
-      isBusinessAdmin: roles.includes('Admin'),
+      isBusinessAdmin: roles.includes(OWNER_ROLE),
       roles,
     };
   }
@@ -158,7 +159,7 @@ export class AuthService {
       status: user.status.toLowerCase(),
       businessId: user.businessId,
       language: user.language,
-      isBusinessAdmin: roles.includes('Admin'),
+      isBusinessAdmin: roles.includes(OWNER_ROLE),
       roles,
       permissions: Array.from(new Set([...rolePerms, ...directPerms])),
       business: user.business
