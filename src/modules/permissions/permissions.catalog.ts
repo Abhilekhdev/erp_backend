@@ -370,6 +370,23 @@ export const PERMISSION_CATALOG: PermGroup[] = [
     ],
   },
   {
+    // GOURI ships this report with NO permission check at all — it is merely hidden from the
+    // sidebar for non-admins, so any logged-in user can read the whole business's trail by URL.
+    // We gate it properly, and default everyone to their own activity only.
+    key: 'activity_log',
+    label: 'Activity Log',
+    items: [
+      {
+        type: 'radio',
+        name: 'activity_log_view',
+        options: [
+          { value: 'activity_log.view_all', label: "View all users' activity" },
+          { value: 'activity_log.view_own', label: 'View own activity only' },
+        ],
+      },
+    ],
+  },
+  {
     key: 'settings',
     label: 'Settings',
     items: [

@@ -25,6 +25,34 @@ export const envSchema = z.object({
 
   THROTTLE_TTL: z.coerce.number().int().positive().default(60),
   THROTTLE_LIMIT: z.coerce.number().int().positive().default(120),
+
+  // ── Mail (SMTP) ──────────────────────────────────────────────────────────
+  // Key names mirror the legacy Laravel .env so the same credentials drop straight in.
+  // All optional: with no MAIL_HOST the app still boots and mail sending reports
+  // "not configured" instead of crashing.
+  MAIL_MAILER: z.string().default('smtp'),
+  MAIL_HOST: z.string().optional().default(''),
+  MAIL_PORT: z.coerce.number().int().positive().default(587),
+  MAIL_USERNAME: z.string().optional().default(''),
+  MAIL_PASSWORD: z.string().optional().default(''),
+  /** 'tls' (STARTTLS, port 587) or 'ssl' (implicit TLS, port 465). */
+  MAIL_ENCRYPTION: z.enum(['tls', 'ssl', '']).optional().default('tls'),
+  MAIL_FROM_ADDRESS: z.string().optional().default(''),
+  MAIL_FROM_NAME: z.string().optional().default(''),
+
+  // ── S3 (document uploads) ────────────────────────────────────────────────
+  // Optional: when AWS_BUCKET is empty, uploads fall back to local disk (./uploads).
+  AWS_ACCESS_KEY_ID: z.string().optional().default(''),
+  AWS_SECRET_ACCESS_KEY: z.string().optional().default(''),
+  AWS_DEFAULT_REGION: z.string().optional().default('ap-south-1'),
+  AWS_BUCKET: z.string().optional().default(''),
+  /** Set for S3-compatible providers (MinIO, DigitalOcean Spaces, Cloudflare R2). */
+  AWS_ENDPOINT: z.string().optional().default(''),
+  AWS_USE_PATH_STYLE_ENDPOINT: z
+    .enum(['true', 'false'])
+    .optional()
+    .default('false')
+    .transform((v) => v === 'true'),
 });
 
 export type Env = z.infer<typeof envSchema>;

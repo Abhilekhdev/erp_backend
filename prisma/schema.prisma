@@ -299,6 +299,7 @@ model Business {
   auditLogs             AuditLog[]
   notificationTemplates NotificationTemplate[]
   invoiceSchemes        InvoiceScheme[]
+  payrollPayments       PayrollPayment[]
   contacts              Contact[]
   customerGroups        CustomerGroup[]
   units                 Unit[]
@@ -597,11 +598,49 @@ model Payroll {
   group    PayrollGroup? @relation(fields: [payrollGroupId], references: [id], onDelete: SetNull)
   user     User          @relation("UserPayrolls", fields: [userId], references: [id], onDelete: Cascade)
   lines    PayrollLine[]
+  payments PayrollPayment[]
 
   @@index([businessId])
   @@index([userId])
   @@index([payrollGroupId])
   @@map("payrolls")
+}
+
+/// A payment recorded against a payroll (payslip). In GOURI these live in the generic
+/// `transaction_payments` table (payroll = a `transactions` row); that table belongs to the
+/// not-yet-built Payments/Accounts core, so payroll payments are normalized here with the SAME
+/// column keys GOURI uses in PayrollController@postAddPayment.
+/// Payment status is derived: Σ paid >= final_total → PAID, > 0 → PARTIAL, else DUE.
+model PayrollPayment {
+  id                    Int       @id @default(autoincrement())
+  businessId            Int       @map("business_id")
+  payrollId             Int       @map("payroll_id")
+  amount                Decimal   @default(0) @db.Decimal(22, 4)
+  method                String    @db.VarChar(50) // cash/card/cheque/bank_transfer/other/custom_pay_1..7
+  transactionNo         String?   @map("transaction_no") @db.VarChar(255)
+  cardTransactionNumber String?   @map("card_transaction_number") @db.VarChar(255)
+  cardNumber            String?   @map("card_number") @db.VarChar(255)
+  cardType              String?   @map("card_type") @db.VarChar(50)
+  cardHolderName        String?   @map("card_holder_name") @db.VarChar(255)
+  cardMonth             String?   @map("card_month") @db.VarChar(255)
+  cardYear              String?   @map("card_year") @db.VarChar(255)
+  cardSecurity          String?   @map("card_security") @db.VarChar(5)
+  chequeNumber          String?   @map("cheque_number") @db.VarChar(255)
+  bankAccountNumber     String?   @map("bank_account_number") @db.VarChar(255)
+  note                  String?   @db.Text
+  paymentRefNo          String?   @map("payment_ref_no") @db.VarChar(191)
+  accountId             Int?      @map("account_id") // FK -> accounts (Accounts module, later)
+  paidOn                DateTime  @map("paid_on")
+  createdBy             Int?      @map("created_by")
+  createdAt             DateTime? @default(now()) @map("created_at")
+  updatedAt             DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  payroll  Payroll  @relation(fields: [payrollId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([payrollId])
+  @@map("payroll_payments")
 }
 
 // A single allowance/deduction line on a payroll. `amount` is the input; `computed` the resolved value
@@ -998,10 +1037,12 @@ model AuditLog {
   business Business? @relation(fields: [businessId], references: [id])
   user     User?     @relation(fields: [userId], references: [id])
 
-  @@index([businessId])
-  @@index([userId])
-  @@index([action])
-  @@index([createdAt])
+  // The report is always tenant-scoped and ordered newest-first, so every read path starts with
+  // businessId and ends at createdAt. Single-column indexes would force a sort of the whole tenant.
+  @@index([businessId, createdAt(sort: Desc)]) // global Activity Log report + module/action filters
+  @@index([businessId, userId, createdAt(sort: Desc)]) // "activity BY this user"
+  @@index([businessId, subjectType, subjectId, createdAt(sort: Desc)]) // "activity ON this record/user"
+  @@index([createdAt]) // retention purge (cross-tenant)
   @@map("audit_logs")
 }
 

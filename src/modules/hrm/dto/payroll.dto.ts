@@ -9,7 +9,11 @@ const nullableId = z.preprocess(
   (v) => (v === '' || v === undefined ? undefined : v),
   z.coerce.number().int().positive().nullable().optional(),
 );
+/** Empty query-string params arrive as '' — treat them as "no filter", not as a bad value. */
+const blank = (v: unknown) => (v === '' || v === null || v === undefined ? undefined : v);
 const month = z.string().regex(/^\d{4}-\d{2}$/, 'Pick a month (YYYY-MM)');
+/** Optional month FILTER (unlike `month` above, which is a required field on create/generate). */
+const optMonth = z.preprocess(blank, month.optional());
 
 const lineSchema = z.object({
   type: z.enum(['allowance', 'deduction']),
@@ -50,6 +54,13 @@ export const payrollQuerySchema = z.object({
   departmentId: optId,
   designationId: optId,
   locationId: optId,
-  month: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+  month: optMonth,
 });
 export class PayrollQueryDto extends createZodDto(payrollQuerySchema) {}
+
+/** Edit a payroll group — GOURI getEditPayrollGroup/getUpdatePayrollGroup only change name + status. */
+export const updatePayrollGroupSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  status: z.enum(['draft', 'final']).optional(),
+});
+export class UpdatePayrollGroupDto extends createZodDto(updatePayrollGroupSchema) {}

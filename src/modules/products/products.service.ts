@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { AuditService } from '../../common/audit/audit.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import type { SaveProductDto } from './dto/save-product.dto';
 import type { ProductsQueryDto } from './dto/products-query.dto';
@@ -12,7 +13,37 @@ type PriceLine = NonNullable<SaveProductDto['single']>;
 
 @Injectable()
 export class ProductsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
+
+  /**
+   * Flat "what a user would call the product" state, for the activity trail.
+   *
+   * A product's prices are not on its own row — they live in child `variations`, which a save wipes
+   * and rebuilds. So the generic Prisma audit hook cannot see a price edit at all; Product is marked
+   * `manual` in AUDITED_MODELS and logged here instead, by comparing this snapshot before and after.
+   * Flattening variation prices to `<variation> purchase/sell price` is what turns an entry into the
+   * line a user actually wants: "Sell price 100 → 120".
+   */
+  private async auditSnapshot(id: number): Promise<Record<string, unknown>> {
+    const p = await this.prisma.product.findUnique({
+      where: { id },
+      include: { variations: { where: { deletedAt: null }, orderBy: { id: 'asc' } } },
+    });
+    if (!p) return {};
+    const { variations, ...scalars } = p;
+    const flat: Record<string, unknown> = { ...scalars };
+    for (const v of variations) {
+      // A single product has one "DUMMY" variation — its prices ARE the product's prices.
+      const prefix = v.name === 'DUMMY' ? '' : `${v.name} `;
+      flat[`${prefix}purchasePrice`] = v.defaultPurchasePrice?.toString() ?? null;
+      flat[`${prefix}sellPrice`] = v.defaultSellPrice?.toString() ?? null;
+      flat[`${prefix}sellPriceIncTax`] = v.sellPriceIncTax?.toString() ?? null;
+    }
+    return flat;
+  }
 
   // ── reference validation (GOURI has no DB FKs — validate same-tenant here) ──
   private async assertRefs(businessId: number, dto: SaveProductDto) {
@@ -172,18 +203,25 @@ export class ProductsService {
       },
       { timeout: 30000 },
     );
-    return this.findOne(businessId, productId);
+    // Overlap the audit snapshot with the response read — on a serverless DB a sequential extra
+    // round-trip is the whole cost, so never spend one the request has to wait on.
+    const [after, out] = await Promise.all([this.auditSnapshot(productId), this.findOne(businessId, productId)]);
+    this.audit.record({ model: 'Product', subjectId: productId, action: 'created', after, name: dto.name, businessId });
+    return out;
   }
 
   async update(businessId: number, id: number, dto: SaveProductDto) {
     const existing = await this.prisma.product.findFirst({ where: { id, businessId } });
     if (!existing) throw new NotFoundException('Product not found');
+    // Kicked off here, awaited after validation — it rides along with queries we already make.
+    const beforeSnapshot = this.auditSnapshot(id);
     await this.assertRefs(businessId, dto);
     const wantedSku = dto.sku?.trim();
     if (wantedSku && wantedSku !== existing.sku) {
       const dup = await this.prisma.product.findFirst({ where: { businessId, sku: wantedSku, id: { not: id } } });
       if (dup) throw new BadRequestException('That SKU is already in use');
     }
+    const before = await beforeSnapshot;
     await this.prisma.$transaction(
       async (tx) => {
         const sku = wantedSku || existing.sku;
@@ -195,13 +233,24 @@ export class ProductsService {
       },
       { timeout: 30000 },
     );
-    return this.findOne(businessId, id);
+    const [after, out] = await Promise.all([this.auditSnapshot(id), this.findOne(businessId, id)]);
+    this.audit.record({ model: 'Product', subjectId: id, action: 'updated', before, after, name: dto.name, businessId });
+    return out;
   }
 
   async setActive(businessId: number, id: number, active: boolean) {
     const p = await this.prisma.product.findFirst({ where: { id, businessId } });
     if (!p) throw new NotFoundException('Product not found');
     await this.prisma.product.update({ where: { id }, data: { isInactive: !active } });
+    this.audit.record({
+      model: 'Product',
+      subjectId: id,
+      action: 'updated',
+      before: { isInactive: p.isInactive },
+      after: { isInactive: !active },
+      name: p.name,
+      businessId,
+    });
     return this.findOne(businessId, id);
   }
 
@@ -210,7 +259,9 @@ export class ProductsService {
     if (!p) throw new NotFoundException('Product not found');
     // NOTE: GOURI blocks deletion when the product is used in any transaction — add that guard once
     // the transaction core exists. Hard delete cascades variations / product_variations / group prices.
+    const before = await this.auditSnapshot(id);
     await this.prisma.product.delete({ where: { id } });
+    this.audit.record({ model: 'Product', subjectId: id, action: 'deleted', before, name: p.name, businessId });
     return { success: true, msg: 'Product deleted successfully' };
   }
 

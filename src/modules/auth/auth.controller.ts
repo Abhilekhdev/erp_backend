@@ -4,6 +4,7 @@ import { UnauthorizedException } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import type { Env } from '../../config/env.validation';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import { AuditService } from '../../common/audit/audit.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import { AuthService, type AuthUserDto, type UserWithAuth } from './auth.service';
@@ -23,6 +24,7 @@ export class AuthController {
     private readonly tokens: TokenService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService<Env, true>,
+    private readonly audit: AuditService,
   ) {}
 
   @Public()
@@ -53,7 +55,40 @@ export class AuthController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ): Promise<SessionResponse> {
-    const user = await this.auth.validateLogin(dto.email, dto.password);
+    // Sessions leave no DB write the middleware could infer them from, so they are logged by hand.
+    // Failed attempts matter most — they are the only trace of someone probing an account.
+    let user: UserWithAuth;
+    try {
+      user = await this.auth.validateLogin(dto.email, dto.password);
+    } catch (err) {
+      // File the attempt against the targeted account so it surfaces on that user's profile and in
+      // their business's report — "someone tried to get into your account" is the point of logging
+      // it. An unknown email has no tenant, so it stays a system-level entry.
+      const target = await this.prisma.user.findUnique({
+        where: { email: dto.email },
+        select: { id: true, businessId: true },
+      });
+      this.audit.log({
+        action: 'failed_login',
+        userId: target?.id ?? null,
+        businessId: target?.businessId ?? null,
+        subjectType: target ? 'User' : null,
+        subjectId: target?.id ?? null,
+        description: `Failed login attempt for ${dto.email}`,
+        properties: { email: dto.email, reason: (err as Error).message },
+        ...this.auditMeta(req),
+      });
+      throw err;
+    }
+    this.audit.log({
+      action: 'login',
+      userId: user.id,
+      businessId: user.businessId,
+      subjectType: 'User',
+      subjectId: user.id,
+      description: 'Logged in',
+      ...this.auditMeta(req),
+    });
     return this.issueSession(user, req, res);
   }
 
@@ -77,10 +112,20 @@ export class AuthController {
 
   @Post('logout')
   @HttpCode(200)
-  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  async logout(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+    @CurrentUser() payload: AccessPayload,
+  ) {
     const raw = req.cookies?.[this.cookieName];
     if (raw) await this.tokens.revoke(raw);
     this.clearRefreshCookie(res);
+    this.audit.log({
+      action: 'logout',
+      subjectType: 'User',
+      subjectId: payload.sub,
+      description: 'Logged out',
+    });
     return { success: true };
   }
 
@@ -97,6 +142,11 @@ export class AuthController {
 
   private meta(req: Request) {
     return { userAgent: req.get('user-agent') ?? undefined, ipAddress: req.ip };
+  }
+
+  /** Login/register are @Public, so there is no CLS causer to fall back on — pass it explicitly. */
+  private auditMeta(req: Request) {
+    return { ipAddress: req.ip ?? null, userAgent: req.get('user-agent') ?? null };
   }
 
   private async issueSession(

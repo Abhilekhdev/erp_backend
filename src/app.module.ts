@@ -5,10 +5,12 @@ import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { ClsModule } from 'nestjs-cls';
 
 import { validateEnv, type Env } from './config/env.validation';
+import { AuditContextInterceptor } from './common/audit/audit-context.interceptor';
 import { CommonModule } from './common/common.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { PrismaModule } from './infra/prisma/prisma.module';
+import { ActivityLogModule } from './modules/activity-log/activity-log.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { BusinessLocationsModule } from './modules/business-locations/business-locations.module';
 import { BrandsModule } from './modules/brands/brands.module';
@@ -72,10 +74,14 @@ import { UsersModule } from './modules/users/users.module';
     WarrantiesModule,
     SellingPriceGroupsModule,
     ProductsModule,
+    ActivityLogModule,
     HealthModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
+    // Must precede any handler work: it lifts the JWT's causer/tenant into CLS so the Prisma
+    // audit middleware knows who is behind each write.
+    { provide: APP_INTERCEPTOR, useClass: AuditContextInterceptor },
     { provide: APP_INTERCEPTOR, useClass: ResponseInterceptor },
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
   ],

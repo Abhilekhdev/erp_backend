@@ -21,6 +21,7 @@ import { LeavesController } from './leaves.controller';
 import { LeavesService } from './leaves.service';
 import { PayrollController } from './payroll.controller';
 import { PayrollService } from './payroll.service';
+import { PayslipPdfService } from './payslip-pdf.service';
 import { SalesTargetsController } from './sales-targets.controller';
 import { SalesTargetsService } from './sales-targets.service';
 import { ShiftsController } from './shifts.controller';
@@ -56,6 +57,7 @@ import { ShiftsService } from './shifts.service';
     HrmSettingsService,
     AllowanceDeductionsService,
     PayrollService,
+    PayslipPdfService,
   ],
   exports: [DepartmentsService, DesignationsService, LeaveTypesService, LeavesService],
 })

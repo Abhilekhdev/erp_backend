@@ -1,10 +1,10 @@
 import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
 
-const optId = z.preprocess(
-  (v) => (v === '' || v === null || v === undefined ? undefined : v),
-  z.coerce.number().int().positive().optional(),
-);
+/** Empty query-string params arrive as '' — treat them as "no filter", not as a bad value. */
+const blank = (v: unknown) => (v === '' || v === null || v === undefined ? undefined : v);
+const optId = z.preprocess(blank, z.coerce.number().int().positive().optional());
+const optStr = z.preprocess(blank, z.string().optional());
 
 export const leavesQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
@@ -12,8 +12,8 @@ export const leavesQuerySchema = z.object({
   search: z.string().optional().default(''),
   userId: optId,
   leaveTypeId: optId,
-  status: z.enum(['pending', 'approved', 'cancelled']).optional(),
-  startDate: z.string().optional(),
-  endDate: z.string().optional(),
+  status: z.preprocess(blank, z.enum(['pending', 'approved', 'cancelled']).optional()),
+  startDate: optStr,
+  endDate: optStr,
 });
 export class LeavesQueryDto extends createZodDto(leavesQuerySchema) {}
