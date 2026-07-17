@@ -153,6 +153,15 @@ export class UsersService {
     };
   }
 
+  /** True when this user is the business owner — the account created at registration. */
+  private async isOwner(businessId: number, userId: number): Promise<boolean> {
+    const business = await this.prisma.business.findUnique({
+      where: { id: businessId },
+      select: { ownerId: true },
+    });
+    return business?.ownerId === userId;
+  }
+
   async findOne(businessId: number, id: number) {
     const user = await this.prisma.user.findFirst({
       where: { id, businessId, deletedAt: null },
@@ -182,6 +191,8 @@ export class UsersService {
       allowLogin: user.allowLogin,
       isActive: user.status === 'ACTIVE',
       roleId: user.roles[0]?.roleId ?? null,
+      /** The owner account holds the reserved `Super Admin` role — its role is not editable. */
+      isOwner: await this.isOwner(businessId, user.id),
       isCmmsnAgnt: user.isCmmsnAgnt,
       cmmsnPercent: Number(user.cmmsnPercent),
       maxSalesDiscountPercent:
@@ -322,23 +333,16 @@ export class UsersService {
     if (dto.username && dto.username !== user.username) await this.assertUniqueUsername(dto.username, id);
     await this.assertHrmRefs(businessId, dto);
 
-    // Role change — cannot strip the last Admin's Admin role, and nobody can be promoted INTO Admin
-    // (it is the owner's wildcard role).
+    // Role change — the owner's role is fixed, and nobody can be promoted INTO the owner role.
     if (dto.roleId !== undefined && dto.roleId !== user.roles[0]?.roleId) {
+      // The business owner IS the Super Admin; that pairing is set at registration and never changes.
+      if (await this.isOwner(businessId, id)) {
+        throw new ForbiddenException(`The business owner's ${OWNER_ROLE} role cannot be changed`);
+      }
       const newRole = await this.prisma.role.findFirst({ where: { id: dto.roleId, businessId } });
       if (!newRole) throw new BadRequestException('Selected role is invalid');
       if (newRole.name === OWNER_ROLE) {
         throw new BadRequestException(`The ${OWNER_ROLE} role is reserved for the business owner and cannot be assigned`);
-      }
-      const wasAdmin = user.roles[0]?.role.name === OWNER_ROLE;
-      if (wasAdmin && newRole.name !== OWNER_ROLE) {
-        const adminRole = await this.prisma.role.findFirst({ where: { businessId, name: OWNER_ROLE } });
-        const adminCount = adminRole
-          ? await this.prisma.userRole.count({ where: { roleId: adminRole.id } })
-          : 0;
-        if (adminCount <= 1) {
-          throw new ForbiddenException(`Cannot change the role of the only ${OWNER_ROLE}`);
-        }
       }
     }
 

@@ -22,6 +22,7 @@ import {
   ClockDto,
   CreateAttendanceDto,
   DeleteSelectedDto,
+  ImportAttendanceDto,
   UpdateAttendanceDto,
 } from './dto/attendance.dto';
 
@@ -83,6 +84,13 @@ export class AttendanceController {
   @HttpCode(200)
   deleteSelected(@CurrentUser() user: AccessPayload, @Body() dto: DeleteSelectedDto) {
     return this.attendance.deleteSelected(user.businessId as number, dto.ids);
+  }
+
+  @Post('import')
+  @RequirePermissions('essentials.add_attendance')
+  @HttpCode(200)
+  import(@CurrentUser() user: AccessPayload, @Body() dto: ImportAttendanceDto) {
+    return this.attendance.importAttendance(user.businessId as number, dto.rows);
   }
 
   @Get()

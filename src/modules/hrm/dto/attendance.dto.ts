@@ -35,6 +35,26 @@ export const deleteSelectedSchema = z.object({
 });
 export class DeleteSelectedDto extends createZodDto(deleteSelectedSchema) {}
 
+// Bulk import — one object per attendance record (parsed from the uploaded CSV on the client).
+export const importAttendanceSchema = z.object({
+  rows: z
+    .array(
+      z.object({
+        email: z.string().min(1),
+        clockInTime: z.string().min(1),
+        clockOutTime: z.string().optional(),
+        activityCode: z.string().optional(),
+        shift: z.string().optional(),
+        clockInNote: z.string().optional(),
+        clockOutNote: z.string().optional(),
+        ipAddress: z.string().optional(),
+      }),
+    )
+    .min(1, 'The file has no rows to import')
+    .max(5000, 'Too many rows — import up to 5000 at a time'),
+});
+export class ImportAttendanceDto extends createZodDto(importAttendanceSchema) {}
+
 export const attendanceQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(10),

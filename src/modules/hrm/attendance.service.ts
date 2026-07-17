@@ -1,14 +1,18 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { AbilityService } from '../../common/services/ability.service';
+import { OWNER_ROLE } from '../../common/constants/roles';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import type { AccessPayload } from '../auth/token.service';
 import type {
   AttendanceQueryDto,
   ClockDto,
   CreateAttendanceDto,
+  ImportAttendanceDto,
   UpdateAttendanceDto,
 } from './dto/attendance.dto';
+
+type ImportRow = ImportAttendanceDto['rows'][number];
 
 const VIEW_ALL = 'essentials.view_all_attendance';
 
@@ -180,6 +184,80 @@ export class AttendanceService {
     return { success: true };
   }
 
+  /**
+   * Bulk-import attendance from parsed CSV rows. Resolves email → user, shift name → shift,
+   * activity-code name → id; validates each date-time; collects per-row errors and imports the rest.
+   */
+  async importAttendance(businessId: number, rows: ImportRow[]) {
+    const [users, shifts, codes] = await Promise.all([
+      this.prisma.user.findMany({
+        where: { businessId, deletedAt: null },
+        select: { id: true, email: true },
+      }),
+      this.prisma.shift.findMany({ where: { businessId, deletedAt: null }, select: { id: true, name: true } }),
+      this.prisma.activityCode.findMany({
+        where: { businessId, deletedAt: null },
+        select: { id: true, activityCode: true, activityName: true },
+      }),
+    ]);
+    const userByEmail = new Map(users.map((u) => [u.email.trim().toLowerCase(), u.id]));
+    const shiftByName = new Map(shifts.map((s) => [s.name.trim().toLowerCase(), s.id]));
+    const codeByName = new Map<string, number>();
+    for (const c of codes) {
+      if (c.activityCode) codeByName.set(c.activityCode.trim().toLowerCase(), c.id);
+      if (c.activityName) codeByName.set(c.activityName.trim().toLowerCase(), c.id);
+    }
+
+    const parseDateTime = (s?: string): Date | null | 'invalid' => {
+      const v = (s ?? '').trim();
+      if (!v) return null;
+      const d = new Date(v.includes('T') ? v : v.replace(' ', 'T'));
+      return Number.isNaN(d.getTime()) ? 'invalid' : d;
+    };
+
+    const toCreate: Prisma.AttendanceCreateManyInput[] = [];
+    const errors: { row: number; message: string }[] = [];
+
+    rows.forEach((r, i) => {
+      const line = i + 2; // +1 for 0-index, +1 for the header row — matches the user's spreadsheet
+      const userId = userByEmail.get(r.email.trim().toLowerCase());
+      if (!userId) return errors.push({ row: line, message: `No user with email "${r.email}"` });
+
+      const clockIn = parseDateTime(r.clockInTime);
+      if (clockIn === 'invalid' || clockIn === null) {
+        return errors.push({ row: line, message: 'Invalid or missing clock-in time (use YYYY-MM-DD HH:MM:SS)' });
+      }
+      const clockOut = parseDateTime(r.clockOutTime);
+      if (clockOut === 'invalid') {
+        return errors.push({ row: line, message: 'Invalid clock-out time (use YYYY-MM-DD HH:MM:SS)' });
+      }
+
+      const shiftId = r.shift?.trim() ? shiftByName.get(r.shift.trim().toLowerCase()) : undefined;
+      if (r.shift?.trim() && !shiftId) return errors.push({ row: line, message: `Unknown shift "${r.shift}"` });
+      const activityCodeId = r.activityCode?.trim()
+        ? codeByName.get(r.activityCode.trim().toLowerCase())
+        : undefined;
+      if (r.activityCode?.trim() && !activityCodeId) {
+        return errors.push({ row: line, message: `Unknown activity code "${r.activityCode}"` });
+      }
+
+      toCreate.push({
+        businessId,
+        userId,
+        clockInTime: clockIn,
+        clockOutTime: clockOut ?? null,
+        shiftId: shiftId ?? null,
+        activityCodeId: activityCodeId ?? null,
+        clockInNote: blank(r.clockInNote),
+        clockOutNote: blank(r.clockOutNote),
+        ipAddress: blank(r.ipAddress),
+      });
+    });
+
+    if (toCreate.length) await this.prisma.attendance.createMany({ data: toCreate });
+    return { imported: toCreate.length, failed: errors.length, errors: errors.slice(0, 50) };
+  }
+
   // ── clock in / out ─────────────────────────────────────
   async clockStatus(businessId: number, userId: number) {
     const open = await this.prisma.attendance.findFirst({
@@ -198,6 +276,18 @@ export class AttendanceService {
       where: { businessId, userId, clockOutTime: null },
     });
     if (open) throw new BadRequestException('You are already clocked in');
+
+    // Attendance prerequisites (BUG_016): the user must have BOTH an assigned shift and a work
+    // location before they can mark attendance.
+    const now = new Date();
+    const activeShift = await this.activeUserShift(businessId, userId, now);
+    const hasLocation = await this.userHasLocation(businessId, userId);
+    if (!activeShift || !hasLocation) {
+      throw new BadRequestException(
+        'A shift and a work location must be assigned to you before you can mark attendance',
+      );
+    }
+
     // Activity code defaults from the employee's assigned activity codes (profile) — the first one,
     // and only if it still exists for this business; otherwise none.
     const activityCodeId = await this.defaultActivityCodeId(businessId, userId);
@@ -205,7 +295,8 @@ export class AttendanceService {
       data: {
         businessId,
         userId,
-        clockInTime: new Date(),
+        clockInTime: now,
+        shiftId: activeShift.shiftId, // stamp the shift so it shows on reports (BUG_018/BUG_019)
         activityCodeId,
         clockInNote: blank(dto.note),
         clockInLocation: blank(dto.location),
@@ -213,6 +304,39 @@ export class AttendanceService {
       },
     });
     return this.clockStatus(businessId, userId);
+  }
+
+  /** The user's shift assignment whose date window covers `date` (or an open-ended one). */
+  private async activeUserShift(businessId: number, userId: number, date: Date) {
+    return this.prisma.userShift.findFirst({
+      where: {
+        businessId,
+        userId,
+        OR: [{ startDate: null }, { startDate: { lte: date } }],
+        AND: [{ OR: [{ endDate: null }, { endDate: { gte: date } }] }],
+      },
+      orderBy: { id: 'desc' },
+    });
+  }
+
+  /** True if the user has any work location: a primary location, per-location access, or access-all. */
+  private async userHasLocation(businessId: number, userId: number): Promise<boolean> {
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, businessId },
+      select: { locationId: true, roles: { select: { role: { select: { name: true } } } } },
+    });
+    if (!user) return false;
+    // The business admin (Super Admin / owner) has all-location access via the code-level bypass,
+    // so they aren't required to carry an explicit location assignment.
+    if (user.roles.some((r) => r.role.name === OWNER_ROLE)) return true;
+    if (user.locationId) return true;
+    const perLocation = await this.prisma.userLocation.count({ where: { userId } });
+    if (perLocation > 0) return true;
+    const accessAll = await this.prisma.userPermission.findFirst({
+      where: { userId, permission: { name: 'access_all_locations' } },
+      select: { userId: true },
+    });
+    return Boolean(accessAll);
   }
 
   /** The employee's default activity code (first assigned in their profile), or null if none/deleted. */
@@ -256,15 +380,17 @@ export class AttendanceService {
         where: { businessId, OR: [{ startDate: null }, { startDate: { lte: end } }], AND: [{ OR: [{ endDate: null }, { endDate: { gte: start } }] }] },
         include: { user: true },
       }),
+      // Any clock-in that day marks the employee present for their assigned shift — records created
+      // via self clock-in used to carry a null shiftId, which wrongly showed everyone as absent (BUG_019).
       this.prisma.attendance.findMany({
-        where: { businessId, clockInTime: { gte: start, lte: end }, shiftId: { not: null } },
-        include: { user: true },
+        where: { businessId, clockInTime: { gte: start, lte: end } },
+        select: { userId: true },
       }),
     ]);
+    const presentUserIds = new Set(attendances.map((a) => a.userId));
     return {
       rows: shifts.map((sh) => {
         const assigned = userShifts.filter((us) => us.shiftId === sh.id);
-        const presentUserIds = new Set(attendances.filter((a) => a.shiftId === sh.id).map((a) => a.userId));
         const present = assigned.filter((us) => presentUserIds.has(us.userId));
         const absent = assigned.filter((us) => !presentUserIds.has(us.userId));
         return {

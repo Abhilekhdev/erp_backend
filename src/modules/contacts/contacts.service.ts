@@ -1,13 +1,12 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, type Contact, type PayTermType } from '@prisma/client';
 import { PrismaService } from '../../infra/prisma/prisma.service';
-import { formatContactId, typesFor } from './contacts.constants';
+import { formatContactId, toPayTermType, typesFor } from './contacts.constants';
 import type { ListContactsQueryDto } from './dto/list-contacts.query';
 import type { SaveContactDto } from './dto/save-contact.dto';
 
 const blank = (v?: string | null): string | null => (v == null || v === '' ? null : v);
-const toPayTerm = (v?: string | null): PayTermType | null =>
-  v === 'days' ? 'DAYS' : v === 'months' ? 'MONTHS' : null;
+const toPayTerm = (v?: string | null): PayTermType | null => toPayTermType(v);
 
 @Injectable()
 export class ContactsService {

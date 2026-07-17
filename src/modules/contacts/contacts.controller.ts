@@ -3,19 +3,26 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   HttpCode,
   Param,
   ParseIntPipe,
   Patch,
   Post,
   Query,
+  Res,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../../common/decorators/require-permissions.decorator';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import type { AccessPayload } from '../auth/token.service';
 import { ContactsService } from './contacts.service';
+import { ContactsImportService } from './import/contacts-import.service';
 import { ListContactsQueryDto } from './dto/list-contacts.query';
 import { SaveContactDto } from './dto/save-contact.dto';
 
@@ -27,12 +34,58 @@ const DELETE = ['supplier.delete', 'customer.delete'] as const;
 @Controller('contacts')
 @UseGuards(PermissionsGuard)
 export class ContactsController {
-  constructor(private readonly contacts: ContactsService) {}
+  constructor(
+    private readonly contacts: ContactsService,
+    private readonly imports: ContactsImportService,
+  ) {}
 
   @Get()
   @RequirePermissions(...VIEW)
   findAll(@CurrentUser() user: AccessPayload, @Query() query: ListContactsQueryDto) {
     return this.contacts.findAll(user.businessId as number, query);
+  }
+
+  // ── import ───────────────────────────────────────────
+  // GOURI gates both import routes on `supplier.create` OR `customer.create`
+  // (ContactController.php:997) — an OR, so it never re-checks the permission against each row's type.
+
+  /** The column spec, so the instructions table on screen can never drift from the parser. */
+  @Get('import/columns')
+  @RequirePermissions(...CREATE)
+  importColumns() {
+    return { data: this.imports.columns() };
+  }
+
+  /** Generated on the fly — there is no template file checked into the repo to go stale. */
+  @Get('import/template')
+  @RequirePermissions(...CREATE)
+  @Header('Cache-Control', 'no-store')
+  async importTemplate(@Query('format') format: string, @Res() res: Response) {
+    const fmt = format === 'csv' ? 'csv' : 'xlsx';
+    const buffer = await this.imports.buildTemplate(fmt);
+    res.set({
+      'Content-Type':
+        fmt === 'csv' ? 'text/csv' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="import_contacts_template.${fmt}"`,
+    });
+    res.end(buffer);
+  }
+
+  /**
+   * `dryRun=true` returns the same report without writing — the preview step GOURI has no equivalent
+   * of. It is deliberately stateless: the file is re-sent on confirm rather than parked on the
+   * server, so an abandoned preview leaves nothing behind to clean up.
+   */
+  @Post('import')
+  @RequirePermissions(...CREATE)
+  @HttpCode(200)
+  @UseInterceptors(FileInterceptor('file')) // memory storage — the upload never touches disk
+  importContacts(
+    @CurrentUser() user: AccessPayload,
+    @UploadedFile() file: Express.Multer.File,
+    @Query('dryRun') dryRun?: string,
+  ) {
+    return this.imports.import(user.businessId as number, user.sub, file, dryRun === 'true');
   }
 
   // Declared before ':id' so these are not captured as an id param.

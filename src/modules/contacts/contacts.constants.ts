@@ -20,3 +20,11 @@ export function typesFor(listType: 'supplier' | 'customer'): string[] {
 export function formatContactId(prefix: string, count: number): string {
   return `${prefix}${String(count).padStart(4, '0')}`;
 }
+
+/**
+ * The API speaks GOURI's lowercase `days`/`months`; the Prisma enum is `DAYS`/`MONTHS` (mapped back
+ * to the lowercase DB values). Shared so the form and the importer cannot map it differently.
+ */
+export function toPayTermType(v?: string | null): 'DAYS' | 'MONTHS' | null {
+  return v === 'days' ? 'DAYS' : v === 'months' ? 'MONTHS' : null;
+}

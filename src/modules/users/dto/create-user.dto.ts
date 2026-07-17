@@ -2,6 +2,31 @@ import { createZodDto } from 'nestjs-zod';
 import { z } from 'zod';
 
 const optStr = z.string().optional();
+
+/**
+ * Optional date-of-birth. A native <input type="date"> can emit a 5+ digit year (e.g. "99999-07-05"),
+ * which then blows up when Postgres tries to store it — so validate a real 4-digit-year calendar date
+ * in range [1900, today] and return a friendly message instead of a 500.
+ */
+const optionalDob = z.preprocess(
+  (v) => (v === '' || v === null ? undefined : v),
+  z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Enter a valid date of birth (YYYY-MM-DD, 4-digit year)')
+    .refine((s) => {
+      const [y, m, d] = s.split('-').map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d));
+      // Reject non-calendar dates (e.g. Feb 30 → rolls over), years before 1900, and future dates.
+      return (
+        dt.getUTCFullYear() === y &&
+        dt.getUTCMonth() === m - 1 &&
+        dt.getUTCDate() === d &&
+        y >= 1900 &&
+        dt.getTime() <= Date.now()
+      );
+    }, 'Enter a valid date of birth (4-digit year, not in the future)')
+    .optional(),
+);
 // A numeric field coming from an HTML form: '' | null | undefined means "not provided" (→ undefined),
 // anything else is coerced and validated by `inner`. This prevents both Number('') === 0 AND
 // coerce(undefined) === NaN (the bug where an empty commission/discount box failed validation).
@@ -20,13 +45,19 @@ export const createUserSchema = z.object({
   lastName: optStr,
   email: z.string().min(1, 'Email is required').email('Enter a valid email').max(191),
 
-  // Login
+  // Login. Password is optional at the schema level (edit keeps the current one, non-login users have
+  // none) but, WHEN present, must be strong. `create()` separately requires it for a login-enabled user.
   username: optStr,
   password: z
     .string()
     .max(191)
     .optional()
-    .refine((v) => !v || v.length >= 8, { message: 'Password must be at least 8 characters' }),
+    .refine((v) => !v || v.length >= 8, { message: 'Password must be at least 8 characters' })
+    .refine((v) => !v || /[A-Za-z]/.test(v), { message: 'Password must include at least one letter' })
+    .refine((v) => !v || /\d/.test(v), { message: 'Password must include at least one number' })
+    .refine((v) => !v || /[^A-Za-z0-9]/.test(v), {
+      message: 'Password must include at least one special character (e.g. !@#$%)',
+    }),
   allowLogin: z.boolean().optional().default(true),
   isActive: z.boolean().optional().default(true),
 
@@ -62,7 +93,7 @@ export const createUserSchema = z.object({
   leaveTypeIds: z.array(z.coerce.number().int().positive()).optional().default([]),
 
   // Profile
-  dob: optStr,
+  dob: optionalDob,
   gender: optStr,
   maritalStatus: optStr,
   bloodGroup: optStr,
