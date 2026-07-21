@@ -1,11 +1,26 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import ExcelJS from 'exceljs';
 import { AuditService } from '../../common/audit/audit.service';
+import { AbilityService } from '../../common/services/ability.service';
+import { StorageService } from '../../common/services/storage.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import type { AccessPayload } from '../auth/token.service';
 import type { SaveProductDto } from './dto/save-product.dto';
 import type { ProductsQueryDto } from './dto/products-query.dto';
 
 const blank = (v?: string | null): string | null => (v == null || v === '' ? null : v);
+
+const ALLOWED_IMAGE = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
+/** GOURI allows 5 MB (config/constants.php) but silently DROPS anything larger — we reject instead. */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+export interface UploadedImage {
+  originalname: string;
+  mimetype: string;
+  size: number;
+  buffer: Buffer;
+}
 const num = (v?: number | null): number | null => (v == null ? null : v);
 const HYPHEN_BARCODES = new Set(['C128', 'C39']);
 
@@ -16,6 +31,8 @@ export class ProductsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly ability: AbilityService,
+    private readonly storage: StorageService,
   ) {}
 
   /**
@@ -64,6 +81,17 @@ export class ProductsService {
       const n = await this.prisma.unit.count({ where: { id: { in: dto.sub_unit_ids }, businessId, deletedAt: null } });
       if (n !== new Set(dto.sub_unit_ids).size) throw new BadRequestException('One or more sub-units are invalid');
     }
+    // Locations and racks both name business_locations — a crafted payload must not reach across tenants.
+    const locationIds = [
+      ...new Set([...(dto.product_locations ?? []), ...Object.keys(dto.product_racks ?? {}).map(Number)]),
+    ].filter((id) => Number.isInteger(id) && id > 0);
+    if (locationIds.length) {
+      const n = await this.prisma.businessLocation.count({
+        where: { id: { in: locationIds }, businessId, deletedAt: null },
+      });
+      if (n !== locationIds.length) throw new BadRequestException('One or more business locations are invalid');
+    }
+
     if (dto.type === 'combo' && dto.combo) {
       const ids = dto.combo.composition.map((c) => c.variation_id);
       const n = await this.prisma.variation.count({
@@ -102,8 +130,169 @@ export class ProductsService {
       productDescription: blank(dto.product_description),
       warrantyId: dto.warranty_id ?? null,
       notForSelling: dto.not_for_selling,
+      preparationTimeInMinutes: dto.preparation_time_in_minutes ?? null,
+      image: blank(dto.image),
       createdAt: new Date(),
     };
+  }
+
+  /**
+   * Replace-set the location assignments and rack details.
+   *
+   * GOURI syncs locations but *blind-inserts* racks (`ProductUtil::addRackDetails`), so editing a
+   * product that already had racks can leave duplicate rows for the same location. Deleting first
+   * (plus the unique key on product+location) makes a save idempotent however many times it runs.
+   */
+  private async writeLocationsAndRacks(
+    tx: Prisma.TransactionClient,
+    businessId: number,
+    productId: number,
+    dto: SaveProductDto,
+  ): Promise<void> {
+    if (dto.product_locations) {
+      await tx.productLocation.deleteMany({ where: { productId } });
+      const ids = [...new Set(dto.product_locations)];
+      if (ids.length) {
+        await tx.productLocation.createMany({
+          data: ids.map((locationId) => ({ productId, locationId })),
+        });
+      }
+    }
+
+    if (dto.product_racks) {
+      await tx.productRack.deleteMany({ where: { productId } });
+      const rows = Object.entries(dto.product_racks)
+        .map(([locationId, r]) => ({
+          businessId,
+          productId,
+          locationId: Number(locationId),
+          rack: blank(r.rack),
+          row: blank(r.row),
+          position: blank(r.position),
+        }))
+        // A location the user left entirely blank is not a rack assignment.
+        .filter((r) => Number.isInteger(r.locationId) && (r.rack || r.row || r.position));
+      if (rows.length) await tx.productRack.createMany({ data: rows });
+    }
+  }
+
+  /**
+   * POST /products/image — store the file and hand back its path for the product payload.
+   *
+   * Uploaded separately from the product itself so the JSON save stays a plain JSON call: the form
+   * uploads on file-select, then submits the returned path as `image`. Unlike the contacts import,
+   * this file IS a record, not transport, so it is persisted via StorageService — S3 when
+   * AWS_BUCKET is set, local disk otherwise. The returned `path` is identical either way.
+   */
+  async uploadImage(businessId: number, file?: UploadedImage) {
+    if (!file) throw new BadRequestException('No file uploaded');
+    if (!ALLOWED_IMAGE.includes(file.mimetype)) {
+      throw new BadRequestException('Product image must be a PNG, JPG, GIF or WEBP image');
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      throw new BadRequestException(`Image must be under ${MAX_IMAGE_BYTES / 1024 / 1024} MB`);
+    }
+    // Business-prefixed + random: no collisions, and an upload can never overwrite another tenant's file.
+    return this.storage.put('products', file, businessId);
+  }
+
+  // ── media (brochure + variation images) ───────────────
+
+  /** GOURI's allowed brochure mimes (config/constants.php `document_mimes`). */
+  private static readonly BROCHURE_MIMES = [
+    'application/pdf',
+    'text/csv',
+    'application/zip',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+  ];
+
+  /**
+   * Attach a file to a product — the brochure, or an extra photo for a variation.
+   *
+   * `products.image` stays the single primary image; anything else lives in `media`, keyed by
+   * (modelType, modelId, modelMediaType) exactly like GOURI's morph table.
+   */
+  async uploadMedia(
+    businessId: number,
+    userId: number,
+    productId: number,
+    kind: 'product_brochure' | 'variation_image',
+    file?: UploadedImage,
+  ) {
+    const product = await this.prisma.product.findFirst({ where: { id: productId, businessId } });
+    if (!product) throw new NotFoundException('Product not found');
+    if (!file) throw new BadRequestException('No file uploaded');
+
+    const allowed = kind === 'product_brochure' ? ProductsService.BROCHURE_MIMES : ALLOWED_IMAGE;
+    if (!allowed.includes(file.mimetype)) {
+      throw new BadRequestException(
+        kind === 'product_brochure'
+          ? 'Brochure must be a PDF, Word document, image, CSV or ZIP'
+          : 'Variation image must be a PNG, JPG, GIF or WEBP image',
+      );
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      throw new BadRequestException(`File must be under ${MAX_IMAGE_BYTES / 1024 / 1024} MB`);
+    }
+
+    const stored = await this.storage.put(kind === 'product_brochure' ? 'brochures' : 'products', file, businessId);
+    // One brochure per product (GOURI passes `is_single = true`) — replace the old one.
+    if (kind === 'product_brochure') {
+      await this.deleteMediaWhere({ businessId, modelType: 'Product', modelId: productId, modelMediaType: kind });
+    }
+    const row = await this.prisma.media.create({
+      data: {
+        businessId,
+        modelType: 'Product',
+        modelId: productId,
+        modelMediaType: kind,
+        filePath: stored.path,
+        fileName: file.originalname,
+        mimeType: file.mimetype,
+        fileSize: file.size,
+        uploadedBy: userId,
+      },
+    });
+    return { id: row.id, path: stored.path, url: stored.url, fileName: row.fileName, kind };
+  }
+
+  /** Remove the rows AND the stored objects, so deleting never leaves an orphan file behind. */
+  private async deleteMediaWhere(where: Prisma.MediaWhereInput): Promise<number> {
+    const rows = await this.prisma.media.findMany({ where, select: { id: true, filePath: true } });
+    if (!rows.length) return 0;
+    await this.prisma.media.deleteMany({ where: { id: { in: rows.map((r) => r.id) } } });
+    // Best-effort: a missing object must not fail the request the user actually asked for.
+    await Promise.all(rows.map((r) => this.storage.remove(r.filePath).catch(() => undefined)));
+    return rows.length;
+  }
+
+  async listMedia(businessId: number, productId: number) {
+    const rows = await this.prisma.media.findMany({
+      where: { businessId, modelType: 'Product', modelId: productId },
+      orderBy: { id: 'asc' },
+    });
+    const data = await Promise.all(
+      rows.map(async (r) => ({
+        id: r.id,
+        kind: r.modelMediaType,
+        path: r.filePath,
+        url: await this.storage.url(r.filePath),
+        fileName: r.fileName,
+        mimeType: r.mimeType,
+        fileSize: r.fileSize,
+      })),
+    );
+    return { data };
+  }
+
+  async removeMedia(businessId: number, mediaId: number) {
+    const removed = await this.deleteMediaWhere({ id: mediaId, businessId });
+    if (!removed) throw new NotFoundException('File not found');
+    return { success: true, msg: 'File deleted successfully' };
   }
 
   private skuOf(prefix: string | null, id: number): string {
@@ -199,6 +388,7 @@ export class ProductsService {
         const sku = wantedSku || this.skuOf(biz?.skuPrefix ?? '', product.id);
         if (!wantedSku) await tx.product.update({ where: { id: product.id }, data: { sku } });
         await this.buildVariations(tx, product.id, sku, dto);
+        await this.writeLocationsAndRacks(tx, businessId, product.id, dto);
         return product.id;
       },
       { timeout: 30000 },
@@ -230,6 +420,7 @@ export class ProductsService {
         // scratch. Once purchases/stock reference variation ids, switch to an id-preserving sync.
         await tx.productVariation.deleteMany({ where: { productId: id } }); // cascades variations + group prices
         await this.buildVariations(tx, id, sku, dto);
+        await this.writeLocationsAndRacks(tx, businessId, id, dto);
       },
       { timeout: 30000 },
     );
@@ -266,7 +457,8 @@ export class ProductsService {
   }
 
   // ── list ──────────────────────────────────────────────
-  async list(businessId: number, query: ProductsQueryDto) {
+  async list(user: AccessPayload, query: ProductsQueryDto) {
+    const businessId = user.businessId as number;
     const s = query.search.trim();
     const where: Prisma.ProductWhereInput = {
       businessId,
@@ -274,8 +466,25 @@ export class ProductsService {
       ...(query.brandId ? { brandId: query.brandId } : {}),
       ...(query.unitId ? { unitId: query.unitId } : {}),
       ...(query.type ? { type: query.type } : {}),
+      ...(query.taxId ? { taxRateId: query.taxId } : {}),
       ...(query.active !== undefined ? { isInactive: !query.active } : {}),
-      ...(s ? { OR: [{ name: { contains: s, mode: 'insensitive' } }, { sku: { contains: s, mode: 'insensitive' } }] } : {}),
+      ...(query.notForSelling !== undefined ? { notForSelling: query.notForSelling } : {}),
+      // 'none' finds products that were never assigned to a location — GOURI's "None" filter option.
+      ...(query.locationId === 'none'
+        ? { locations: { none: {} } }
+        : query.locationId
+          ? { locations: { some: { locationId: query.locationId } } }
+          : {}),
+      ...(s
+        ? {
+            OR: [
+              { name: { contains: s, mode: 'insensitive' } },
+              { sku: { contains: s, mode: 'insensitive' } },
+              // GOURI's SKU column also searches variation sub-SKUs (ProductController.php:291-296).
+              { variations: { some: { deletedAt: null, subSku: { contains: s, mode: 'insensitive' } } } },
+            ],
+          }
+        : {}),
     };
     const [rows, total, units, cats, brands, taxes] = await Promise.all([
       this.prisma.product.findMany({
@@ -283,7 +492,10 @@ export class ProductsService {
         skip: (query.page - 1) * query.pageSize,
         take: query.pageSize,
         orderBy: { name: 'asc' },
-        include: { variations: { where: { deletedAt: null }, select: { sellPriceIncTax: true } } },
+        include: {
+          variations: { where: { deletedAt: null }, select: { sellPriceIncTax: true, defaultPurchasePrice: true } },
+          locations: { select: { location: { select: { id: true, name: true } } } },
+        },
       }),
       this.prisma.product.count({ where }),
       this.prisma.unit.findMany({ where: { businessId }, select: { id: true, actualName: true } }),
@@ -295,11 +507,27 @@ export class ProductsService {
     const cMap = new Map(cats.map((c) => [c.id, c.name]));
     const bMap = new Map(brands.map((b) => [b.id, b.name]));
     const tMap = new Map(taxes.map((t) => [t.id, t]));
+
+    // GOURI hides these two columns behind their own permissions (product/index.blade.php) — a
+    // salesperson can be allowed to see products without seeing what the business paid for them.
+    // Both were seeded in our catalogue but never enforced, so the grants did nothing. Resolve them
+    // once per request via AbilityService (in-memory; the guard already loaded the set).
+    const [canSeePurchase, canSeeSelling] = await Promise.all([
+      this.ability.can(user, 'view_purchase_price'),
+      this.ability.can(user, 'access_default_selling_price'),
+    ]);
+
+    const range = (values: number[]) => ({
+      min: values.length ? Math.min(...values) : 0,
+      max: values.length ? Math.max(...values) : 0,
+    });
+
     return {
       data: rows.map((p) => {
-        const prices = p.variations.map((v) => (v.sellPriceIncTax == null ? 0 : Number(v.sellPriceIncTax)));
-        const min = prices.length ? Math.min(...prices) : 0;
-        const max = prices.length ? Math.max(...prices) : 0;
+        const sell = range(p.variations.map((v) => (v.sellPriceIncTax == null ? 0 : Number(v.sellPriceIncTax))));
+        const purchase = range(
+          p.variations.map((v) => (v.defaultPurchasePrice == null ? 0 : Number(v.defaultPurchasePrice))),
+        );
         return {
           id: p.id,
           name: p.name,
@@ -315,12 +543,165 @@ export class ProductsService {
           enableStock: p.enableStock,
           isInactive: p.isInactive,
           notForSelling: p.notForSelling,
-          priceMin: min,
-          priceMax: max,
+          locations: p.locations.map((l) => l.location.name),
+          customField1: p.productCustomField1 ?? '',
+          customField2: p.productCustomField2 ?? '',
+          customField3: p.productCustomField3 ?? '',
+          customField4: p.productCustomField4 ?? '',
+          // null (not 0) when not permitted, so the UI drops the column instead of showing a
+          // convincing-looking zero.
+          priceMin: canSeeSelling ? sell.min : null,
+          priceMax: canSeeSelling ? sell.max : null,
+          purchasePriceMin: canSeePurchase ? purchase.min : null,
+          purchasePriceMax: canSeePurchase ? purchase.max : null,
         };
       }),
       total,
+      can: { viewPurchasePrice: canSeePurchase, viewSellingPrice: canSeeSelling },
     };
+  }
+
+  /**
+   * Download Excel — the current filter set, every matching row, no pagination.
+   *
+   * GOURI gates this on `is_admin` rather than a permission (`ProductController@downloadExcel`), so
+   * a manager who can see the list cannot export it. We reuse the list's own permission and, more
+   * importantly, its price gating: an export must not become a way around `view_purchase_price`.
+   */
+  async exportExcel(user: AccessPayload, query: ProductsQueryDto): Promise<Buffer> {
+    const all = await this.list(user, { ...query, page: 1, pageSize: 10_000 });
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Products');
+    const columns = [
+      { header: 'SKU', key: 'sku', width: 18 },
+      { header: 'Product', key: 'name', width: 32 },
+      { header: 'Type', key: 'type', width: 12 },
+      { header: 'Category', key: 'category', width: 20 },
+      { header: 'Brand', key: 'brand', width: 18 },
+      { header: 'Unit', key: 'unit', width: 14 },
+      { header: 'Tax', key: 'tax', width: 16 },
+      { header: 'Business locations', key: 'locations', width: 32 },
+      ...(all.can.viewPurchasePrice ? [{ header: 'Purchase price', key: 'purchase', width: 16 }] : []),
+      ...(all.can.viewSellingPrice ? [{ header: 'Selling price (inc tax)', key: 'sell', width: 20 }] : []),
+      { header: 'Status', key: 'status', width: 12 },
+      { header: 'Not for selling', key: 'notForSelling', width: 14 },
+      { header: 'Custom field 1', key: 'customField1', width: 18 },
+      { header: 'Custom field 2', key: 'customField2', width: 18 },
+      { header: 'Custom field 3', key: 'customField3', width: 18 },
+      { header: 'Custom field 4', key: 'customField4', width: 18 },
+    ];
+    ws.columns = columns;
+    ws.getRow(1).font = { bold: true };
+
+    const priceCell = (min: number | null, max: number | null) =>
+      min == null || max == null ? '' : min === max ? min : `${min} - ${max}`;
+
+    for (const p of all.data) {
+      ws.addRow({
+        sku: p.sku,
+        name: p.name,
+        type: p.type ?? '',
+        category: p.category,
+        brand: p.brand,
+        unit: p.unit,
+        tax: p.tax,
+        locations: p.locations.join(', '),
+        purchase: priceCell(p.purchasePriceMin, p.purchasePriceMax),
+        sell: priceCell(p.priceMin, p.priceMax),
+        status: p.isInactive ? 'Inactive' : 'Active',
+        notForSelling: p.notForSelling ? 'Yes' : 'No',
+        customField1: p.customField1,
+        customField2: p.customField2,
+        customField3: p.customField3,
+        customField4: p.customField4,
+      });
+    }
+    return Buffer.from(await wb.xlsx.writeBuffer());
+  }
+
+  // ── mass actions (GOURI's list footer) ────────────────
+
+  /** Every id that exists in this tenant — silently ignores anything that doesn't. */
+  private async ownedIds(businessId: number, ids: number[]): Promise<number[]> {
+    if (!ids.length) throw new BadRequestException('Select at least one product');
+    const rows = await this.prisma.product.findMany({
+      where: { id: { in: ids }, businessId },
+      select: { id: true, name: true },
+    });
+    if (!rows.length) throw new BadRequestException('None of those products exist');
+    return rows.map((r) => r.id);
+  }
+
+  async massDelete(businessId: number, ids: number[]) {
+    const owned = await this.ownedIds(businessId, ids);
+    // NOTE: like remove(), this needs GOURI's "used in a transaction" guard once transactions exist.
+    const { count } = await this.prisma.product.deleteMany({ where: { id: { in: owned }, businessId } });
+    this.audit.log({
+      action: 'bulk_deleted',
+      subjectType: 'Product',
+      businessId,
+      description: `${count} product${count === 1 ? '' : 's'} deleted`,
+      properties: { count, ids: owned },
+    });
+    return { success: true, count, msg: `${count} product(s) deleted` };
+  }
+
+  async massSetActive(businessId: number, ids: number[], active: boolean) {
+    const owned = await this.ownedIds(businessId, ids);
+    const { count } = await this.prisma.product.updateMany({
+      where: { id: { in: owned }, businessId },
+      data: { isInactive: !active },
+    });
+    this.audit.log({
+      action: 'bulk_updated',
+      subjectType: 'Product',
+      businessId,
+      description: `${count} product${count === 1 ? '' : 's'} ${active ? 'activated' : 'deactivated'}`,
+      properties: { count, ids: owned, isInactive: !active },
+    });
+    return { success: true, count, msg: `${count} product(s) ${active ? 'activated' : 'deactivated'}` };
+  }
+
+  /**
+   * Add or remove a set of products from a set of locations in one go (GOURI's
+   * `updateProductLocation`). "Add" is idempotent — re-adding an existing pair is a no-op rather
+   * than a duplicate row.
+   */
+  async massUpdateLocations(businessId: number, ids: number[], locationIds: number[], mode: 'add' | 'remove') {
+    const owned = await this.ownedIds(businessId, ids);
+    if (!locationIds.length) throw new BadRequestException('Select at least one location');
+    const validLocations = await this.prisma.businessLocation.count({
+      where: { id: { in: locationIds }, businessId, deletedAt: null },
+    });
+    if (validLocations !== new Set(locationIds).size) {
+      throw new BadRequestException('One or more business locations are invalid');
+    }
+
+    if (mode === 'remove') {
+      const { count } = await this.prisma.productLocation.deleteMany({
+        where: { productId: { in: owned }, locationId: { in: locationIds } },
+      });
+      this.audit.log({
+        action: 'bulk_updated',
+        subjectType: 'Product',
+        businessId,
+        description: `${owned.length} product(s) removed from ${locationIds.length} location(s)`,
+        properties: { products: owned, locations: locationIds, mode },
+      });
+      return { success: true, count, msg: 'Products removed from the selected locations' };
+    }
+
+    const pairs = owned.flatMap((productId) => locationIds.map((locationId) => ({ productId, locationId })));
+    const { count } = await this.prisma.productLocation.createMany({ data: pairs, skipDuplicates: true });
+    this.audit.log({
+      action: 'bulk_updated',
+      subjectType: 'Product',
+      businessId,
+      description: `${owned.length} product(s) added to ${locationIds.length} location(s)`,
+      properties: { products: owned, locations: locationIds, mode },
+    });
+    return { success: true, count, msg: 'Products added to the selected locations' };
   }
 
   // ── findOne (edit form) ───────────────────────────────
@@ -338,6 +719,8 @@ export class ProductsService {
             },
           },
         },
+        locations: { select: { locationId: true } },
+        racks: { orderBy: { locationId: 'asc' } },
       },
     });
     if (!p) throw new NotFoundException('Product not found');
@@ -369,6 +752,13 @@ export class ProductsService {
       warrantyId: p.warrantyId,
       isInactive: p.isInactive,
       notForSelling: p.notForSelling,
+      preparationTimeInMinutes: p.preparationTimeInMinutes,
+      image: p.image ?? '',
+      productLocations: p.locations.map((l) => l.locationId),
+      // Keyed by location id so the form can look a location's row up directly.
+      productRacks: Object.fromEntries(
+        p.racks.map((r) => [r.locationId, { rack: r.rack ?? '', row: r.row ?? '', position: r.position ?? '' }]),
+      ),
       productVariations: p.productVariations.map((pv) => ({
         id: pv.id,
         name: pv.name,
@@ -428,7 +818,8 @@ export class ProductsService {
 
   // ── meta (form dropdowns) ─────────────────────────────
   async meta(businessId: number) {
-    const [units, categories, brands, taxRates, warranties, priceGroups, templates] = await Promise.all([
+    const [units, categories, brands, taxRates, warranties, priceGroups, templates, locations, settings] =
+      await Promise.all([
       this.prisma.unit.findMany({ where: { businessId, deletedAt: null }, orderBy: { actualName: 'asc' } }),
       this.prisma.category.findMany({ where: { businessId, deletedAt: null, categoryType: 'product' }, orderBy: { name: 'asc' } }),
       this.prisma.brand.findMany({ where: { businessId, deletedAt: null }, select: { id: true, name: true }, orderBy: { name: 'asc' } }),
@@ -440,6 +831,29 @@ export class ProductsService {
         include: { values: { select: { name: true }, orderBy: { id: 'asc' } } },
         orderBy: { name: 'asc' },
       }),
+      this.prisma.businessLocation.findMany({
+        where: { businessId, deletedAt: null },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      }),
+      // GOURI hides whole sections of the product form behind business settings — the form must be
+      // driven by these, not render everything unconditionally.
+      this.prisma.business.findUnique({
+        where: { id: businessId },
+        select: {
+          enableBrand: true,
+          enableCategory: true,
+          enableSubCategory: true,
+          enablePriceTax: true,
+          enableSubUnits: true,
+          enableRacks: true,
+          enableRow: true,
+          enablePosition: true,
+          enableProductExpiry: true,
+          defaultProfitPercent: true,
+          defaultUnit: true,
+        },
+      }),
     ]);
     return {
       units: units.map((u) => ({ id: u.id, name: `${u.actualName} (${u.shortName})`, baseUnitId: u.baseUnitId })),
@@ -450,6 +864,20 @@ export class ProductsService {
       priceGroups,
       variationTemplates: templates.map((t) => ({ id: t.id, name: t.name, values: t.values.map((v) => v.name) })),
       barcodeTypes: ['C128', 'C39', 'EAN13', 'EAN8', 'UPCA', 'UPCE'],
+      locations,
+      settings: {
+        enableBrand: settings?.enableBrand ?? true,
+        enableCategory: settings?.enableCategory ?? true,
+        enableSubCategory: settings?.enableSubCategory ?? true,
+        enablePriceTax: settings?.enablePriceTax ?? true,
+        enableSubUnits: settings?.enableSubUnits ?? false,
+        enableRacks: settings?.enableRacks ?? false,
+        enableRow: settings?.enableRow ?? false,
+        enablePosition: settings?.enablePosition ?? false,
+        enableProductExpiry: settings?.enableProductExpiry ?? false,
+        defaultProfitPercent: settings?.defaultProfitPercent != null ? Number(settings.defaultProfitPercent) : 0,
+        defaultUnitId: settings?.defaultUnit ?? null,
+      },
     };
   }
 }

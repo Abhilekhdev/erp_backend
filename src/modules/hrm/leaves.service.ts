@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { Prisma } from '@prisma/client';
 import { AbilityService } from '../../common/services/ability.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import type { AccessPayload } from '../auth/token.service';
 import type { ChangeLeaveStatusDto, CreateLeaveDto, SetLeaveBalancesDto } from './dto/leave.dto';
 import type { LeavesQueryDto } from './dto/leaves-query.dto';
@@ -25,7 +26,48 @@ export class LeavesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly ability: AbilityService,
+    private readonly notifications: NotificationsService,
   ) {}
+
+  /** Display name for notification copy (surname first, matching the leave list). */
+  private async userName(userId: number): Promise<string> {
+    const u = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { surname: true, firstName: true, lastName: true },
+    });
+    return u ? [u.surname, u.firstName, u.lastName].filter(Boolean).join(' ').trim() : 'An employee';
+  }
+
+  /**
+   * Who should hear about a new leave request — GOURI notifies the approvers:
+   * anyone holding `approve_leave`/`crud_all_leave` (via role or direct grant), plus the
+   * applicant's manager (`parentId`). The applicant is never notified about their own request.
+   */
+  private async leaveApprovers(businessId: number, applicantId: number): Promise<number[]> {
+    const PERMS = ['essentials.approve_leave', CRUD_ALL];
+    const [byPerm, applicant, owner] = await Promise.all([
+      this.prisma.user.findMany({
+        where: {
+          businessId,
+          deletedAt: null,
+          OR: [
+            { roles: { some: { role: { permissions: { some: { permission: { name: { in: PERMS } } } } } } } },
+            { permissions: { some: { permission: { name: { in: PERMS } } } } },
+          ],
+        },
+        select: { id: true },
+      }),
+      this.prisma.user.findUnique({ where: { id: applicantId }, select: { parentId: true } }),
+      this.prisma.business.findUnique({ where: { id: businessId }, select: { ownerId: true } }),
+    ]);
+
+    const ids = byPerm.map((u) => u.id);
+    if (applicant?.parentId) ids.push(applicant.parentId);
+    // The tenant Admin bypasses every permission check (Gate::before), so they never match the
+    // permission query above — include the business owner explicitly.
+    if (owner?.ownerId) ids.push(owner.ownerId);
+    return ids.filter((id) => id !== applicantId);
+  }
 
   /**
    * The user ids an "own-leave" (non-crud_all) user may see: themselves + every recursive subordinate
@@ -266,6 +308,18 @@ export class LeavesService {
       }
       return created.id;
     });
+
+    // GOURI: NewLeaveNotification → the approvers/manager.
+    const applicant = await this.userName(targetUserId);
+    await this.notifications.notify({
+      businessId,
+      userIds: await this.leaveApprovers(businessId, targetUserId),
+      type: 'NewLeaveNotification',
+      msg: `${applicant} applied for ${leaveType.name} (${fmt(start)} to ${fmt(end)}, ${days} day${days > 1 ? 's' : ''})`,
+      icon: 'calendar',
+      link: '/hrm/leaves',
+    });
+
     return this.findOne(businessId, id);
   }
 
@@ -309,6 +363,20 @@ export class LeavesService {
         },
       });
     });
+
+    // GOURI: LeaveStatusNotification → the applicant. 'CANCELLED' reads as "Rejected" in the UI.
+    if (newStatus !== leave.status) {
+      const label = newStatus === 'CANCELLED' ? 'rejected' : newStatus.toLowerCase();
+      await this.notifications.notify({
+        businessId,
+        userIds: [leave.userId],
+        type: 'LeaveStatusNotification',
+        msg: `Your ${leave.leaveType.name} request (${fmt(leave.startDate)} to ${fmt(leave.endDate)}) was ${label}`,
+        icon: newStatus === 'APPROVED' ? 'check' : newStatus === 'CANCELLED' ? 'x' : 'calendar',
+        link: '/hrm/leaves',
+      });
+    }
+
     return this.findOne(businessId, id);
   }
 

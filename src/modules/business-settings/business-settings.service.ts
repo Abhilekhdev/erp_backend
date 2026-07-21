@@ -1,8 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { StorageService } from '../../common/services/storage.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import {
   ACCOUNTING_METHODS,
@@ -28,7 +26,6 @@ import {
 } from './business-settings.constants';
 import type { UpdateBusinessSettingsDto } from './dto/update-business-settings.dto';
 
-const UPLOAD_DIR = join(process.cwd(), 'uploads', 'business');
 const ALLOWED_IMAGE = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'];
 const LOGO_FIELDS = { logo: 'logo', login_logo: 'loginLogo' } as const;
 
@@ -42,7 +39,10 @@ export interface UploadedImage {
 
 @Injectable()
 export class BusinessSettingsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly storage: StorageService,
+  ) {}
 
   /** GET /business/settings — the tenant's business row + all dropdown option lists. */
   async getSettings(businessId: number) {
@@ -191,7 +191,10 @@ export class BusinessSettingsService {
     return updated;
   }
 
-  /** POST /business/settings/logo — store a logo/login-logo image and set its column. */
+  /**
+   * POST /business/settings/logo — store a logo/login-logo image and set its column.
+   * Persisted via StorageService: S3 when AWS_BUCKET is set, local disk otherwise.
+   */
   async uploadLogo(businessId: number, type: 'logo' | 'login_logo', file?: UploadedImage) {
     if (!file) throw new BadRequestException('No file uploaded');
     if (!(type in LOGO_FIELDS)) throw new BadRequestException('Invalid logo type');
@@ -202,17 +205,12 @@ export class BusinessSettingsService {
       throw new BadRequestException('Logo must be under 2 MB');
     }
 
-    await mkdir(UPLOAD_DIR, { recursive: true });
-    const ext = extname(file.originalname).toLowerCase() || '.png';
-    const filename = `${businessId}-${type}-${randomUUID()}${ext}`;
-    await writeFile(join(UPLOAD_DIR, filename), file.buffer);
-
     const column = LOGO_FIELDS[type];
-    const relativePath = `business/${filename}`;
+    const stored = await this.storage.put('business', file, `${businessId}-${type}`);
     await this.prisma.business.update({
       where: { id: businessId },
-      data: { [column]: relativePath },
+      data: { [column]: stored.path },
     });
-    return { field: column, path: relativePath, url: `/uploads/${relativePath}` };
+    return { field: column, path: stored.path, url: stored.url };
   }
 }

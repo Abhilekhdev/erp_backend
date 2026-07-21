@@ -14,7 +14,9 @@ import type { RegisterDto } from './dto/register.dto';
 export const userInclude = {
   roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } },
   permissions: { include: { permission: true } },
-  business: true,
+  // The currency comes along so the whole UI can render the tenant's symbol (₹ / $ / …) without
+  // every screen fetching business settings.
+  business: { include: { currency: true } },
 } satisfies Prisma.UserInclude;
 
 export type UserWithAuth = Prisma.UserGetPayload<{ include: typeof userInclude }>;
@@ -34,7 +36,16 @@ export interface AuthUserDto {
   isBusinessAdmin: boolean;
   roles: string[];
   permissions: string[];
-  business: { id: number; name: string; logo: string | null } | null;
+  business: {
+    id: number;
+    name: string;
+    logo: string | null;
+    /** Tenant currency — drives every money symbol in the UI. */
+    currencySymbol: string;
+    currencyCode: string;
+    currencySymbolPlacement: string;
+    currencyPrecision: number;
+  } | null;
 }
 
 // Default modules enabled for a brand-new business (mirrors Laravel's createNewBusiness).
@@ -163,7 +174,15 @@ export class AuthService {
       roles,
       permissions: Array.from(new Set([...rolePerms, ...directPerms])),
       business: user.business
-        ? { id: user.business.id, name: user.business.name, logo: user.business.logo }
+        ? {
+            id: user.business.id,
+            name: user.business.name,
+            logo: user.business.logo,
+            currencySymbol: user.business.currency?.symbol ?? '',
+            currencyCode: user.business.currency?.code ?? '',
+            currencySymbolPlacement: user.business.currencySymbolPlacement.toLowerCase(),
+            currencyPrecision: user.business.currencyPrecision,
+          }
         : null,
     };
   }

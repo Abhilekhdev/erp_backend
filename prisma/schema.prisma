@@ -300,6 +300,7 @@ model Business {
   notificationTemplates NotificationTemplate[]
   invoiceSchemes        InvoiceScheme[]
   payrollPayments       PayrollPayment[]
+  notifications         Notification[]
   contacts              Contact[]
   customerGroups        CustomerGroup[]
   units                 Unit[]
@@ -310,6 +311,9 @@ model Business {
   warranties            Warranty[]
   sellingPriceGroups    SellingPriceGroup[]
   products              Product[]
+  productRacks          ProductRack[]
+  barcodes              Barcode[]
+  media                 Media[]
 
   @@index([currencyId])
   @@index([ownerId])
@@ -734,6 +738,8 @@ model BusinessLocation {
   userLocations   UserLocation[]
   primaryForUsers User[]         @relation("UserPrimaryLocation")
   holidays        Holiday[]
+  productLocations ProductLocation[]
+  productRacks     ProductRack[]
 
   @@index([businessId])
   @@index([sellingPriceGroupId])
@@ -842,6 +848,7 @@ model User {
   documents           UserDocument[]
   refreshTokens       RefreshToken[]
   auditLogs           AuditLog[]
+  notifications       Notification[]
 
   @@index([businessId])
   @@index([userType])
@@ -1090,6 +1097,41 @@ model ReferenceCount {
 
   @@index([businessId, refType])
   @@map("reference_counts")
+}
+
+// ===================== NOTIFICATIONS (HEADER BELL) =========================
+
+/// In-app notifications behind the header bell. Ports Laravel's `notifications` table
+/// (GOURI: uuid id · type · morphs notifiable · text data · read_at · timestamps).
+///
+/// Two deliberate changes from legacy:
+///  - the polymorphic `notifiable_*` pair is specialized to `userId` (same call the rest of this
+///    schema makes for Spatie's model_has_* pivots) — GOURI only ever notifies a User.
+///  - `business_id` added so the bell is tenant-scoped and indexable; legacy relies on the
+///    user relation alone.
+///
+/// `data` holds the already-normalized payload GOURI produces in Util::parseNotifications /
+/// DataController::parse_notification — `{ msg, icon, link }` — so rendering never needs the
+/// fragile per-type if/elseif chain.
+model Notification {
+  id             String    @id @default(uuid())
+  businessId     Int       @map("business_id")
+  userId         Int       @map("user_id")
+  /// Legacy notification class name, e.g. 'NewLeaveNotification' — kept for parity/filtering.
+  type           String    @db.VarChar(191)
+  notifiableType String    @default("User") @map("notifiable_type") @db.VarChar(191)
+  data           Json
+  readAt         DateTime? @map("read_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+  @@map("notifications")
 }
 
 // ===================== INVOICE SETTINGS ====================================
@@ -1447,10 +1489,118 @@ model Product {
   business          Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
   variations        Variation[]
   productVariations ProductVariation[]
+  locations         ProductLocation[]
+  racks             ProductRack[]
 
   @@index([businessId])
   @@index([type])
   @@map("products")
+}
+
+/// Which business locations sell a product (GOURI `product_locations` pivot, synced on save).
+/// A product with NO rows here is "not assigned to any location" — GOURI's list can filter for it.
+model ProductLocation {
+  productId  Int @map("product_id")
+  locationId Int @map("location_id")
+
+  product  Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  location BusinessLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  // GOURI's pivot has a surrogate id it never uses; the pair is the real key and it makes the
+  // sync-on-save idempotent, which GOURI's blind insert is not.
+  @@id([productId, locationId])
+  @@index([locationId])
+  @@map("product_locations")
+}
+
+/// Files attached to any record (GOURI `media`, a polymorphic morph table).
+///
+/// `products.image` stays the single primary image; everything else — the product brochure and the
+/// per-variation photo galleries — lives here. `filePath` is the storage key (identical whether the
+/// backend is local disk or S3), matching what StorageService returns.
+model Media {
+  id         Int    @id @default(autoincrement())
+  businessId Int    @map("business_id")
+  /// Polymorphic target, e.g. modelType='Product', modelId=12.
+  modelType  String @map("model_type") @db.VarChar(191)
+  modelId    Int    @map("model_id")
+  /// What the file is FOR on that record — GOURI's `model_media_type`
+  /// (e.g. 'product_brochure', 'variation_image'). One record can hold several kinds at once.
+  modelMediaType String? @map("model_media_type") @db.VarChar(191)
+
+  filePath     String  @map("file_path") @db.VarChar(500)
+  fileName     String  @map("file_name") @db.VarChar(255)
+  mimeType     String? @map("mime_type") @db.VarChar(191)
+  fileSize     Int?    @map("file_size")
+  description  String? @db.Text
+  uploadedBy   Int?    @map("uploaded_by")
+
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  // Every read is "the files attached to this record", optionally narrowed by kind.
+  @@index([modelType, modelId, modelMediaType])
+  @@map("media")
+}
+
+/// A label-sheet layout for Print Labels (GOURI `barcodes`).
+///
+/// This is the sticker geometry — how big each label is and how they tile on the page — NOT the
+/// barcode symbology (that lives on `products.barcode_type`). Print Labels is unusable without one,
+/// which is why GOURI seeds a set of common Avery-style sheets.
+model Barcode {
+  id                 Int      @id @default(autoincrement())
+  name               String   @db.VarChar(255)
+  description        String?  @db.Text
+  /// Sticker size, in inches (GOURI stores floats and renders with them directly).
+  width              Decimal? @db.Decimal(22, 4)
+  height             Decimal? @db.Decimal(22, 4)
+  paperWidth         Decimal? @map("paper_width") @db.Decimal(22, 4)
+  paperHeight        Decimal? @map("paper_height") @db.Decimal(22, 4)
+  topMargin          Decimal? @map("top_margin") @db.Decimal(22, 4)
+  leftMargin         Decimal? @map("left_margin") @db.Decimal(22, 4)
+  rowDistance        Decimal? @map("row_distance") @db.Decimal(22, 4)
+  colDistance        Decimal? @map("col_distance") @db.Decimal(22, 4)
+  stickersInOneRow   Int?     @map("stickers_in_one_row")
+  stickersInOneSheet Int?     @map("stickers_in_one_sheet")
+  isDefault          Boolean  @default(false) @map("is_default")
+  /// Continuous roll printers have no sheet — only a row of stickers repeating.
+  isContinuous       Boolean  @default(false) @map("is_continuous")
+  /// NULL = a built-in preset shared by every tenant (GOURI allows a null business_id).
+  businessId         Int?     @map("business_id")
+
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("barcodes")
+}
+
+/// Where a product physically sits, per location (GOURI `product_racks`).
+/// Each column is independently gated by a business setting: enableRacks / enableRow / enablePosition.
+model ProductRack {
+  id         Int     @id @default(autoincrement())
+  businessId Int     @map("business_id")
+  locationId Int     @map("location_id")
+  productId  Int     @map("product_id")
+  rack       String? @db.VarChar(255)
+  row        String? @db.VarChar(255)
+  position   String? @db.VarChar(255)
+
+  business Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  location BusinessLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  product  Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // GOURI's addRackDetails blind-inserts with no guard, so editing a product can leave duplicate
+  // rows for the same location. One row per (product, location) makes that impossible.
+  @@unique([productId, locationId])
+  @@index([businessId])
+  @@map("product_racks")
 }
 
 /// One per attribute of a product (GOURI `product_variations`). `isDummy`=true for single/combo,
@@ -1509,7 +1659,9 @@ model VariationGroupPrice {
 
   variation Variation @relation(fields: [variationId], references: [id], onDelete: Cascade)
 
-  @@index([variationId])
+  // A variation has exactly one price per group — this makes the price-list import an upsert
+  // instead of a read-then-write, and stops duplicates from ever accumulating.
+  @@unique([variationId, priceGroupId])
   @@index([priceGroupId])
   @@map("variation_group_prices")
 }

@@ -13,6 +13,19 @@ export const productsQuerySchema = z.object({
   categoryId: optId,
   brandId: optId,
   unitId: optId,
+  taxId: optId,
+  /**
+   * A location id, or the literal `none` — GOURI prepends a "None" option so you can find products
+   * that were never assigned to any location (`ProductController.php:321`).
+   */
+  locationId: z.preprocess(
+    (v) => (v === '' || v === null || v === undefined ? undefined : v),
+    z.union([z.literal('none'), z.coerce.number().int().positive()]).optional(),
+  ),
+  notForSelling: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : v === 'true' || v === true),
+    z.boolean().optional(),
+  ),
   type: z.preprocess(
     (v) => (v === '' || v === null || v === undefined ? undefined : v),
     z.enum(['single', 'variable', 'combo']).optional(),

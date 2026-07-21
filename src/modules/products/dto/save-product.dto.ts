@@ -71,6 +71,25 @@ export const saveProductSchema = z
     product_description: z.string().optional(),
     warranty_id: optId,
     not_for_selling: boolish.optional().default(false),
+    preparation_time_in_minutes: optNum,
+    /** Stored filename from POST /products/image. '' clears the current image. */
+    image: z.string().max(255).optional(),
+    /** Which business locations sell this product; synced (replace-set) on save. */
+    product_locations: z.array(z.coerce.number().int().positive()).optional(),
+    /**
+     * Rack/row/position per location. Sent as a map keyed by location id so a partial payload can
+     * never orphan a row — the whole set is replaced on save.
+     */
+    product_racks: z
+      .record(
+        z.string(),
+        z.object({
+          rack: z.string().max(255).optional(),
+          row: z.string().max(255).optional(),
+          position: z.string().max(255).optional(),
+        }),
+      )
+      .optional(),
     // type-specific payloads
     single: priceLine.optional(),
     variations: z.array(variableAttribute).optional(),

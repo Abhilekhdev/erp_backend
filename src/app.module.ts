@@ -13,8 +13,10 @@ import { PrismaModule } from './infra/prisma/prisma.module';
 import { ActivityLogModule } from './modules/activity-log/activity-log.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { BusinessLocationsModule } from './modules/business-locations/business-locations.module';
+import { BarcodesModule } from './modules/barcodes/barcodes.module';
 import { BrandsModule } from './modules/brands/brands.module';
 import { BusinessSettingsModule } from './modules/business-settings/business-settings.module';
+import { CalendarModule } from './modules/calendar/calendar.module';
 import { CategoriesModule } from './modules/categories/categories.module';
 import { CommissionAgentsModule } from './modules/commission-agents/commission-agents.module';
 import { ContactsModule } from './modules/contacts/contacts.module';
@@ -23,6 +25,7 @@ import { HealthModule } from './modules/health/health.module';
 import { HrmModule } from './modules/hrm/hrm.module';
 import { InvoiceSchemesModule } from './modules/invoice-schemes/invoice-schemes.module';
 import { NotificationTemplatesModule } from './modules/notification-templates/notification-templates.module';
+import { NotificationsModule } from './modules/notifications/notifications.module';
 import { PermissionsModule } from './modules/permissions/permissions.module';
 import { ProductsModule } from './modules/products/products.module';
 import { RolesModule } from './modules/roles/roles.module';
@@ -65,6 +68,8 @@ import { UsersModule } from './modules/users/users.module';
     BusinessLocationsModule,
     InvoiceSchemesModule,
     NotificationTemplatesModule,
+    NotificationsModule,
+    CalendarModule,
     HrmModule,
     UnitsModule,
     CategoriesModule,
@@ -74,6 +79,7 @@ import { UsersModule } from './modules/users/users.module';
     WarrantiesModule,
     SellingPriceGroupsModule,
     ProductsModule,
+    BarcodesModule,
     ActivityLogModule,
     HealthModule,
   ],

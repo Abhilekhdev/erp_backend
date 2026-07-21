@@ -4,6 +4,7 @@ import { AbilityService } from '../../common/services/ability.service';
 import { MailService } from '../../common/services/mail.service';
 import { ReferenceNumberService } from '../../common/services/reference-number.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { PayslipPdfService } from './payslip-pdf.service';
 import type { AccessPayload } from '../auth/token.service';
 import type { AddPayrollPaymentsDto } from './dto/payroll-payment.dto';
@@ -49,6 +50,7 @@ export class PayrollService {
     private readonly refNo: ReferenceNumberService,
     private readonly pdf: PayslipPdfService,
     private readonly mail: MailService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async meta(businessId: number) {
@@ -184,6 +186,23 @@ export class PayrollService {
       await tx.payrollGroup.update({ where: { id: group.id }, data: { grossTotal: round(groupGross) } });
       return group.id;
     });
+
+    // GOURI: PayrollNotification → each employee whose payslip was just generated.
+    const created = await this.prisma.payroll.findMany({
+      where: { payrollGroupId: groupId },
+      select: { userId: true, month: true },
+    });
+    if (created.length) {
+      await this.notifications.notify({
+        businessId,
+        userIds: created.map((p) => p.userId),
+        type: 'PayrollNotification',
+        msg: `Your payslip for ${monthLabel(created[0].month)} is ready`,
+        icon: 'wallet',
+        link: '/hrm/payroll',
+      });
+    }
+
     return this.getGroup(businessId, groupId);
   }
 

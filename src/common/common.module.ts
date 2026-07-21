@@ -3,6 +3,7 @@ import { AuditService } from './audit/audit.service';
 import { AbilityService } from './services/ability.service';
 import { MailService } from './services/mail.service';
 import { ReferenceNumberService } from './services/reference-number.service';
+import { StorageService } from './services/storage.service';
 
 /**
  * Global home for cross-cutting authorization helpers. Exporting AbilityService globally lets both
@@ -12,7 +13,7 @@ import { ReferenceNumberService } from './services/reference-number.service';
  */
 @Global()
 @Module({
-  providers: [AbilityService, AuditService, ReferenceNumberService, MailService],
-  exports: [AbilityService, AuditService, ReferenceNumberService, MailService],
+  providers: [AbilityService, AuditService, ReferenceNumberService, MailService, StorageService],
+  exports: [AbilityService, AuditService, ReferenceNumberService, MailService, StorageService],
 })
 export class CommonModule {}

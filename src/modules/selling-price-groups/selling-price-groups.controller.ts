@@ -8,14 +8,19 @@ import {
   ParseIntPipe,
   Patch,
   Post,
+  Res,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { RequirePermissions } from '../../common/decorators/require-permissions.decorator';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import type { AccessPayload } from '../auth/token.service';
 import { SaveSellingPriceGroupDto } from './dto/save-selling-price-group.dto';
-import { SellingPriceGroupsService } from './selling-price-groups.service';
+import { SellingPriceGroupsService, type UploadedSheet } from './selling-price-groups.service';
 
 // GOURI gates SPG CRUD on the product perms (create/list/delete/toggle → product.create, update → product.update).
 @Controller('selling-price-groups')
@@ -33,6 +38,27 @@ export class SellingPriceGroupsController {
   @RequirePermissions('product.view', 'product.create', 'product.update')
   dropdown(@CurrentUser() user: AccessPayload) {
     return this.groups.forDropdown(user.businessId as number);
+  }
+
+  /** The whole price list as a workbook — edit in Excel, then send it back to /import. */
+  @Get('export')
+  @RequirePermissions('product.view', 'product.create')
+  async exportPrices(@CurrentUser() user: AccessPayload, @Res() res: Response) {
+    const buffer = await this.groups.exportPrices(user.businessId as number);
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': 'attachment; filename="product_group_prices.xlsx"',
+      'Cache-Control': 'no-store',
+    });
+    res.end(buffer);
+  }
+
+  @Post('import')
+  @RequirePermissions('product.update')
+  @HttpCode(200)
+  @UseInterceptors(FileInterceptor('file'))
+  importPrices(@CurrentUser() user: AccessPayload, @UploadedFile() file: UploadedSheet) {
+    return this.groups.importPrices(user.businessId as number, file);
   }
 
   @Get(':id')
