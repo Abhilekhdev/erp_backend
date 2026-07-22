@@ -6,8 +6,10 @@ import { AbilityService } from '../../common/services/ability.service';
 import { StorageService } from '../../common/services/storage.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import type { AccessPayload } from '../auth/token.service';
+import { round4 } from '../purchases/purchase.calc';
 import type { SaveProductDto } from './dto/save-product.dto';
 import type { ProductsQueryDto } from './dto/products-query.dto';
+import type { StockReportQueryDto } from './dto/stock-report-query.dto';
 
 const blank = (v?: string | null): string | null => (v == null || v === '' ? null : v);
 
@@ -25,6 +27,12 @@ const num = (v?: number | null): number | null => (v == null ? null : v);
 const HYPHEN_BARCODES = new Set(['C128', 'C39']);
 
 type PriceLine = NonNullable<SaveProductDto['single']>;
+/** One line of a combo's `variations.combo_variations` JSON. */
+interface ComboItem {
+  variation_id: number;
+  quantity: number;
+  unit_id: number | null;
+}
 
 @Injectable()
 export class ProductsService {
@@ -317,10 +325,13 @@ export class ProductsService {
         subSku: args.subSku,
         variationValueId: args.variationValueId,
         defaultPurchasePrice: num(line.default_purchase_price),
-        dppIncTax: line.dpp_inc_tax ?? 0,
+        // The form computes the tax-inclusive prices, but an API client may send only the exclusive
+        // ones. Falling back to those beats storing 0 — a 0 here would silently zero out the
+        // products list, the stock report's valuation and every printed label.
+        dppIncTax: line.dpp_inc_tax ?? line.default_purchase_price ?? 0,
         profitPercent: line.profit_percent ?? 0,
         defaultSellPrice: num(line.default_sell_price),
-        sellPriceIncTax: num(line.sell_price_inc_tax),
+        sellPriceIncTax: num(line.sell_price_inc_tax ?? line.default_sell_price),
         comboVariations: args.combo ? (args.combo as Prisma.InputJsonValue) : Prisma.JsonNull,
       },
     });
@@ -495,6 +506,9 @@ export class ProductsService {
         include: {
           variations: { where: { deletedAt: null }, select: { sellPriceIncTax: true, defaultPurchasePrice: true } },
           locations: { select: { location: { select: { id: true, name: true } } } },
+          // Stock across every location, as GOURI's list column shows it. A location filter narrows
+          // WHICH products appear, not which stock is summed — same as GOURI.
+          stockLevels: { select: { qtyAvailable: true } },
         },
       }),
       this.prisma.product.count({ where }),
@@ -541,6 +555,10 @@ export class ProductsService {
           taxAmount: p.taxRateId ? Number(tMap.get(p.taxRateId)?.amount ?? 0) : 0,
           taxType: p.taxType,
           enableStock: p.enableStock,
+          /** null for a product that doesn't track stock — the UI prints "—", as GOURI does. */
+          currentStock: p.enableStock
+            ? round4(p.stockLevels.reduce((sum, sl) => sum + Number(sl.qtyAvailable), 0))
+            : null,
           isInactive: p.isInactive,
           notForSelling: p.notForSelling,
           locations: p.locations.map((l) => l.location.name),
@@ -704,6 +722,230 @@ export class ProductsService {
     return { success: true, count, msg: 'Products added to the selected locations' };
   }
 
+  // ── stock report (second tab on the products list) ────
+
+  /**
+   * One row per (variation, location) with its stock and what that stock is worth.
+   *
+   * GOURI builds this as a single query with four correlated subqueries over `transactions`
+   * (`ProductUtil::getProductStockDetails`). Those four — units sold / transferred / adjusted and
+   * the purchase-cost valuation — need the transaction core, so they come back `null` today and the
+   * UI renders them as "—" rather than a misleading 0. Everything else is exact.
+   *
+   * Deliberate divergences from GOURI, each a bug there:
+   *  - soft-deleted variations are excluded (its All Products tab excludes them, this one doesn't);
+   *  - `SUM()` is unnecessary because `(variation, location)` is unique here, but its schema allows
+   *    duplicate rows so it has to sum them;
+   *  - its footer totals are computed client-side from the current PAGE by re-parsing rendered HTML;
+   *    ours are server-side over the whole filtered set.
+   * Combos are excluded exactly as GOURI does — a combo holds no stock of its own, its components do.
+   */
+  async stockReport(user: AccessPayload, query: StockReportQueryDto) {
+    const businessId = user.businessId as number;
+    const s = query.search.trim();
+
+    const productWhere: Prisma.ProductWhereInput = {
+      businessId,
+      type: { in: ['single', 'variable'] },
+      ...(query.categoryId ? { categoryId: query.categoryId } : {}),
+      ...(query.brandId ? { brandId: query.brandId } : {}),
+      ...(query.unitId ? { unitId: query.unitId } : {}),
+      ...(query.taxId ? { taxRateId: query.taxId } : {}),
+      ...(query.active !== undefined ? { isInactive: !query.active } : {}),
+      ...(query.notForSelling !== undefined ? { notForSelling: query.notForSelling } : {}),
+    };
+
+    const where: Prisma.VariationWhereInput = {
+      deletedAt: null,
+      product: productWhere,
+      ...(s
+        ? {
+            OR: [
+              { subSku: { contains: s, mode: 'insensitive' } },
+              { name: { contains: s, mode: 'insensitive' } },
+              { product: { ...productWhere, name: { contains: s, mode: 'insensitive' } } },
+            ],
+          }
+        : {}),
+    };
+
+    const [canSeeSelling, canSeeStockValue] = await Promise.all([
+      this.ability.can(user, 'access_default_selling_price'),
+      this.ability.can(user, 'view_product_stock_value'),
+    ]);
+
+    const [variations, locations] = await Promise.all([
+      this.prisma.variation.findMany({
+        where,
+        orderBy: [{ product: { name: 'asc' } }, { id: 'asc' }],
+        include: {
+          product: {
+            select: {
+              id: true, name: true, type: true, enableStock: true, alertQuantity: true,
+              categoryId: true, unitId: true,
+              productCustomField1: true, productCustomField2: true,
+              productCustomField3: true, productCustomField4: true,
+            },
+          },
+          productVariation: { select: { name: true } },
+          stockLevels: query.locationId ? { where: { locationId: query.locationId } } : true,
+        },
+      }),
+      this.prisma.businessLocation.findMany({
+        where: { businessId, deletedAt: null },
+        select: { id: true, name: true },
+      }),
+    ]);
+
+    const [units, cats] = await Promise.all([
+      this.prisma.unit.findMany({ where: { businessId }, select: { id: true, shortName: true } }),
+      this.prisma.category.findMany({ where: { businessId }, select: { id: true, name: true } }),
+    ]);
+    const uMap = new Map(units.map((u) => [u.id, u.shortName]));
+    const cMap = new Map(cats.map((c) => [c.id, c.name]));
+    const lMap = new Map(locations.map((l) => [l.id, l.name]));
+
+    // ── the figures that come from the transaction core ──
+    // Lots that actually posted stock: a purchase only counts once it is RECEIVED and APPROVED,
+    // the same gate that moved `variation_location_details` in the first place.
+    const variationIds = variations.map((v) => v.id);
+    const lots = variationIds.length
+      ? await this.prisma.purchaseLine.findMany({
+          where: {
+            variationId: { in: variationIds },
+            transaction: { businessId, type: 'PURCHASE', status: 'RECEIVED', isApproved: true },
+          },
+          select: {
+            variationId: true,
+            quantity: true,
+            purchasePriceIncTax: true,
+            quantitySold: true,
+            quantityAdjusted: true,
+            quantityReturned: true,
+            mfgQuantityUsed: true,
+            transaction: { select: { locationId: true } },
+          },
+        })
+      : [];
+
+    /** Per (variation, location): what the remaining lots cost, and how much has left them. */
+    const lotStats = new Map<string, { costOfRemaining: number; sold: number; adjusted: number; returned: number }>();
+    const key = (variationId: number, locationId: number) => `${variationId}:${locationId}`;
+    for (const l of lots) {
+      const k = key(l.variationId, l.transaction.locationId);
+      const acc = lotStats.get(k) ?? { costOfRemaining: 0, sold: 0, adjusted: 0, returned: 0 };
+      const sold = Number(l.quantitySold);
+      const adjusted = Number(l.quantityAdjusted);
+      const returned = Number(l.quantityReturned);
+      const remaining = Number(l.quantity) - (sold + adjusted + returned + Number(l.mfgQuantityUsed));
+      // Value what is LEFT of each lot at that lot's own cost — proper weighted cost, not
+      // "current stock × today's list price". GOURI's version adds purchase RETURNS to the cost of
+      // stock on hand (`status='received' OR type='purchase_return'`), inflating it.
+      acc.costOfRemaining += Math.max(0, remaining) * Number(l.purchasePriceIncTax);
+      acc.sold += sold;
+      acc.adjusted += adjusted;
+      acc.returned += returned;
+      lotStats.set(k, acc);
+    }
+
+    // A variation with no stock row anywhere still belongs in the report — it just has no stock.
+    // GOURI drops those rows whenever a location filter is active, which hides exactly the products
+    // a user is looking for when they ask "what do I have nothing of?".
+    type Row = {
+      variationId: number; productId: number; sku: string; product: string; variation: string;
+      category: string; locationId: number | null; location: string; unit: string;
+      unitPrice: number | null; stock: number; enableStock: boolean; alertQuantity: number | null;
+      stockValueBySalePrice: number | null; stockValueByPurchasePrice: number | null;
+      potentialProfit: number | null;
+      totalSold: number | null; totalTransferred: number | null; totalAdjusted: number | null;
+      customField1: string; customField2: string; customField3: string; customField4: string;
+    };
+
+    const rows: Row[] = [];
+    for (const v of variations) {
+      const p = v.product;
+      const unitPrice = v.sellPriceIncTax != null ? Number(v.sellPriceIncTax) : 0;
+      const purchasePrice = v.defaultPurchasePrice != null ? Number(v.defaultPurchasePrice) : 0;
+      const base = {
+        variationId: v.id,
+        productId: p.id,
+        sku: v.subSku ?? '',
+        product: p.name,
+        // Only a variable product has a meaningful variation label (GOURI blanks it otherwise).
+        variation: p.type === 'variable' ? `${v.productVariation.name} - ${v.name}` : '',
+        category: p.categoryId ? (cMap.get(p.categoryId) ?? '') : '',
+        unit: p.unitId ? (uMap.get(p.unitId) ?? '') : '',
+        unitPrice: canSeeSelling ? unitPrice : null,
+        enableStock: p.enableStock,
+        alertQuantity: p.alertQuantity != null ? Number(p.alertQuantity) : null,
+        customField1: p.productCustomField1 ?? '',
+        customField2: p.productCustomField2 ?? '',
+        customField3: p.productCustomField3 ?? '',
+        customField4: p.productCustomField4 ?? '',
+        // Stock transfers are still to come — sold and adjusted are live now.
+        totalTransferred: null,
+      };
+
+      const valued = (stock: number, locationId: number | null) => {
+        const stats = locationId != null ? lotStats.get(key(v.id, locationId)) : undefined;
+        // Fall back to the variation's list cost only when no lot has posted yet (e.g. stock seeded
+        // before purchases existed) — otherwise the lots are the truth.
+        const cost = stats ? stats.costOfRemaining : stock * purchasePrice;
+        return {
+          stockValueBySalePrice: canSeeStockValue ? stock * unitPrice : null,
+          stockValueByPurchasePrice: canSeeStockValue ? cost : null,
+          potentialProfit: canSeeStockValue ? stock * unitPrice - cost : null,
+          totalSold: stats ? stats.sold : 0,
+          totalAdjusted: stats ? stats.adjusted + stats.returned : 0,
+        };
+      };
+
+      if (v.stockLevels.length === 0) {
+        rows.push({ ...base, locationId: null, location: '', stock: 0, ...valued(0, null) });
+        continue;
+      }
+      for (const sl of v.stockLevels) {
+        const stock = Number(sl.qtyAvailable);
+        rows.push({
+          ...base,
+          locationId: sl.locationId,
+          location: lMap.get(sl.locationId) ?? '',
+          stock,
+          ...valued(stock, sl.locationId),
+        });
+      }
+    }
+
+    const filtered = query.lowStock
+      ? rows.filter((r) => r.enableStock && r.alertQuantity != null && r.stock <= r.alertQuantity)
+      : rows;
+
+    // Server-side grand totals over the WHOLE filtered set — GOURI totals only the visible page,
+    // by re-parsing its own rendered HTML.
+    const sum = (pick: (r: Row) => number | null) =>
+      filtered.reduce((acc, r) => acc + (pick(r) ?? 0), 0);
+    const totals = {
+      // Products with stock tracking off show "—", so they must not be counted as zero-stock items.
+      stock: filtered.reduce((acc, r) => acc + (r.enableStock ? r.stock : 0), 0),
+      stockValueBySalePrice: canSeeStockValue ? sum((r) => r.stockValueBySalePrice) : null,
+      stockValueByPurchasePrice: canSeeStockValue ? sum((r) => r.stockValueByPurchasePrice) : null,
+      potentialProfit: canSeeStockValue ? sum((r) => r.potentialProfit) : null,
+      totalSold: sum((r) => r.totalSold),
+      totalAdjusted: sum((r) => r.totalAdjusted),
+      totalTransferred: null as number | null,
+    };
+
+    const start = (query.page - 1) * query.pageSize;
+    return {
+      data: filtered.slice(start, start + query.pageSize),
+      total: filtered.length,
+      totals,
+      can: { viewSellingPrice: canSeeSelling, viewStockValue: canSeeStockValue },
+      /** Which columns cannot be filled in yet, so the UI can say so instead of showing a fake 0. */
+      pendingColumns: ['totalTransferred'],
+    };
+  }
+
   // ── findOne (edit form) ───────────────────────────────
   async findOne(businessId: number, id: number) {
     const p = await this.prisma.product.findFirst({
@@ -724,6 +966,30 @@ export class ProductsService {
       },
     });
     if (!p) throw new NotFoundException('Product not found');
+
+    // A combo stores only variation ids in its JSON. Resolve them to names and prices here, or the
+    // edit form has nothing to show but "#12" and cannot recompute the bundle's cost.
+    const comboIds = p.productVariations
+      .flatMap((pv) => pv.variations)
+      .flatMap((v) => ((v.comboVariations as ComboItem[] | null) ?? []).map((c) => c.variation_id))
+      .filter((id): id is number => Number.isInteger(id));
+    const comboComponents = comboIds.length
+      ? await this.prisma.variation.findMany({
+          where: { id: { in: comboIds }, product: { businessId } },
+          include: { product: { select: { name: true, unitId: true } } },
+        })
+      : [];
+    const comboMap = new Map(
+      comboComponents.map((v) => [
+        v.id,
+        {
+          label: `${v.product.name}${v.name === 'DUMMY' ? '' : ` - ${v.name}`}${v.subSku ? ` (${v.subSku})` : ''}`,
+          purchasePrice: v.defaultPurchasePrice != null ? Number(v.defaultPurchasePrice) : 0,
+          unitId: v.product.unitId,
+        },
+      ]),
+    );
+
     return {
       id: p.id,
       name: p.name,
@@ -774,7 +1040,14 @@ export class ProductsService {
           profitPercent: Number(v.profitPercent),
           defaultSellPrice: v.defaultSellPrice != null ? Number(v.defaultSellPrice) : null,
           sellPriceIncTax: v.sellPriceIncTax != null ? Number(v.sellPriceIncTax) : null,
-          comboVariations: v.comboVariations ?? null,
+          comboVariations:
+            ((v.comboVariations as ComboItem[] | null) ?? []).map((c) => ({
+              ...c,
+              // A component deleted since the combo was saved resolves to nothing — say so rather
+              // than render "#12" and let the user save a bundle they can't read.
+              label: comboMap.get(c.variation_id)?.label ?? `#${c.variation_id} (no longer available)`,
+              purchasePrice: comboMap.get(c.variation_id)?.purchasePrice ?? 0,
+            })) || null,
           groupPrices: v.groupPrices.map((g) => ({ priceGroupId: g.priceGroupId, priceIncTax: Number(g.priceIncTax) })),
         })),
       })),
@@ -796,7 +1069,11 @@ export class ProductsService {
           ? { OR: [{ subSku: { contains: s, mode: 'insensitive' } }, { product: { name: { contains: s, mode: 'insensitive' } } }] }
           : {}),
       },
-      include: { product: { select: { name: true, unitId: true, barcodeType: true } } },
+      include: {
+        product: { select: { name: true, unitId: true, barcodeType: true } },
+        // Print Labels lets each row print a price-group rate instead of the default price.
+        groupPrices: { select: { priceGroupId: true, priceIncTax: true } },
+      },
       orderBy: { id: 'asc' },
       take: 50,
     });
@@ -808,6 +1085,7 @@ export class ProductsService {
         variationName: v.name === 'DUMMY' ? '' : v.name,
         sku: v.subSku ?? '',
         barcodeType: v.product.barcodeType,
+        groupPrices: v.groupPrices.map((g) => ({ priceGroupId: g.priceGroupId, priceIncTax: Number(g.priceIncTax) })),
         purchasePrice: v.defaultPurchasePrice != null ? Number(v.defaultPurchasePrice) : 0,
         sellPrice: v.defaultSellPrice != null ? Number(v.defaultSellPrice) : 0,
         sellPriceIncTax: v.sellPriceIncTax != null ? Number(v.sellPriceIncTax) : 0,

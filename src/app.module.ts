@@ -28,6 +28,7 @@ import { NotificationTemplatesModule } from './modules/notification-templates/no
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { PermissionsModule } from './modules/permissions/permissions.module';
 import { ProductsModule } from './modules/products/products.module';
+import { PurchasesModule } from './modules/purchases/purchases.module';
 import { RolesModule } from './modules/roles/roles.module';
 import { SellingPriceGroupsModule } from './modules/selling-price-groups/selling-price-groups.module';
 import { TaxRatesModule } from './modules/tax-rates/tax-rates.module';
@@ -80,6 +81,7 @@ import { UsersModule } from './modules/users/users.module';
     SellingPriceGroupsModule,
     ProductsModule,
     BarcodesModule,
+    PurchasesModule,
     ActivityLogModule,
     HealthModule,
   ],

@@ -58,6 +58,8 @@ const DEFAULT_ENABLED_MODULES = [
   'expenses',
 ];
 
+const blank = (v?: string | null): string | null => (v == null || v === '' ? null : v);
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -95,9 +97,12 @@ export class AuthService {
           name: dto.businessName,
           currencyId: dto.currencyId,
           ownerId: owner.id,
+          // The day they signed up. Not asked for — it is only a reporting boundary, and Settings →
+          // Business can move it if the real trading history started earlier.
+          startDate: new Date(),
           timeZone: dto.timeZone || 'Asia/Kolkata',
-          fyStartMonth: dto.fyStartMonth ?? 1,
-          accountingMethod: (dto.accountingMethod ?? 'fifo').toUpperCase() as 'FIFO' | 'LIFO',
+          // fyStartMonth, accountingMethod, tax labels/numbers and the logo all keep their schema
+          // defaults and are set from Business Settings — see the DTO for why they are not asked here.
           // Laravel createNewBusiness defaults: inline tax OFF, 25% default profit.
           enableInlineTax: false,
           defaultProfitPercent: 25,
@@ -114,6 +119,51 @@ export class AuthService {
         data: { name: OWNER_ROLE, businessId: business.id, isDefault: true },
       });
       await tx.userRole.create({ data: { userId: owner.id, roleId: ownerRole.id } });
+
+      // Everything below is what GOURI's `newBusinessDefaultResources` + `addLocation` set up, so a
+      // brand-new tenant can sell on day one instead of hitting "no location" errors everywhere.
+      const scheme = await tx.invoiceScheme.create({
+        data: {
+          businessId: business.id,
+          name: 'Default',
+          prefix: '',
+          startNumber: 1,
+          totalDigits: 4,
+          isDefault: true,
+          createdAt: new Date(),
+        },
+      });
+
+      // The first location. GOURI names it after the business and never asks for the address
+      // separately — same here, but the address is optional so signup stays short.
+      const location = await tx.businessLocation.create({
+        data: {
+          businessId: business.id,
+          name: dto.businessName,
+          locationId: 'BL0001',
+          country: dto.country || '-',
+          state: dto.state || '-',
+          city: dto.city || '-',
+          zipCode: dto.zipCode || '-',
+          landmark: blank(dto.landmark),
+          mobile: blank(dto.mobile),
+          alternateNumber: blank(dto.alternateNumber),
+          website: blank(dto.website),
+          invoiceSchemeId: scheme.id,
+          // No invoice layouts module yet — 0 is the documented placeholder used elsewhere.
+          invoiceLayoutId: 0,
+          isActive: true,
+        },
+      });
+      await tx.referenceCount.create({
+        data: { businessId: business.id, refType: 'business_location', refCount: 1 },
+      });
+      // GOURI mints a per-location permission on create; keep it so location-scoped access works.
+      await tx.permission.upsert({
+        where: { name: `location.${location.id}` },
+        update: {},
+        create: { name: `location.${location.id}`, resource: 'location', action: String(location.id) },
+      });
 
       return owner.id;
     }, { timeout: 20000, maxWait: 15000 });

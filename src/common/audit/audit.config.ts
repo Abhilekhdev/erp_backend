@@ -42,7 +42,12 @@ export const AUDITED_MODELS: Record<string, AuditedModel> = {
   VariationTemplate: { label: 'Variation template', name: (r) => r.name },
   BusinessLocation: { label: 'Business location', name: (r) => r.name },
   BusinessSetting: { label: 'Business settings' },
-  // Transaction core lands here as it is built: Purchase, Sell, Payment, StockTransfer…
+  // Purchases are logged by the service, not the middleware: a purchase is a document plus its
+  // lines plus its stock movements, and the generic hook would only see "Transaction updated"
+  // with no diff — the same reason Product is `manual`.
+  Purchase: { label: 'Purchase', manual: true },
+  PurchasePayment: { label: 'Purchase payment', manual: true },
+  // Sell, StockTransfer and the rest join as they are built.
 };
 
 /**

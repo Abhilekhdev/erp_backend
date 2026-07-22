@@ -23,6 +23,7 @@ import type { AccessPayload } from '../auth/token.service';
 import { MassActionDto, MassActivateDto, MassLocationsDto } from './dto/mass-action.dto';
 import { ProductsQueryDto } from './dto/products-query.dto';
 import { SaveProductDto } from './dto/save-product.dto';
+import { StockReportQueryDto } from './dto/stock-report-query.dto';
 import { ProductsService, type UploadedImage } from './products.service';
 
 @Controller('products')
@@ -48,6 +49,13 @@ export class ProductsController {
   list(@CurrentUser() user: AccessPayload, @Query() query: ProductsQueryDto) {
     // The whole user, not just the tenant: the price columns are permission-gated per caller.
     return this.products.list(user, query);
+  }
+
+  /** The products list's second tab. Its own permission, exactly as in GOURI. */
+  @Get('stock-report')
+  @RequirePermissions('stock_report.view')
+  stockReport(@CurrentUser() user: AccessPayload, @Query() query: StockReportQueryDto) {
+    return this.products.stockReport(user, query);
   }
 
   /** The current filter set as a spreadsheet. Declared before ':id' so it isn't read as an id. */

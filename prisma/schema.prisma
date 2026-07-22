@@ -312,6 +312,8 @@ model Business {
   sellingPriceGroups    SellingPriceGroup[]
   products              Product[]
   productRacks          ProductRack[]
+  transactions          Transaction[]
+  transactionPayments   TransactionPayment[]
   barcodes              Barcode[]
   media                 Media[]
 
@@ -740,6 +742,8 @@ model BusinessLocation {
   holidays        Holiday[]
   productLocations ProductLocation[]
   productRacks     ProductRack[]
+  transactions     Transaction[]
+  stockLevels      VariationLocationDetail[]
 
   @@index([businessId])
   @@index([sellingPriceGroupId])
@@ -1247,6 +1251,7 @@ model Contact {
   business        Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
   customerGroup   CustomerGroup?      @relation(fields: [customerGroupId], references: [id])
   usersWithAccess UserContactAccess[]
+  transactions    Transaction[]
 
   @@index([businessId])
   @@index([type])
@@ -1365,6 +1370,9 @@ model TaxRate {
   business Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
   members  GroupSubTax[] @relation("GroupMembers") // rows where this rate IS the group
   memberOf GroupSubTax[] @relation("MemberGroups") // rows where this rate is a member of a group
+
+  transactions  Transaction[]
+  purchaseLines PurchaseLine[]
 
   @@index([businessId])
   @@map("tax_rates")
@@ -1491,6 +1499,8 @@ model Product {
   productVariations ProductVariation[]
   locations         ProductLocation[]
   racks             ProductRack[]
+  stockLevels       VariationLocationDetail[]
+  purchaseLines     PurchaseLine[]
 
   @@index([businessId])
   @@index([type])
@@ -1511,6 +1521,36 @@ model ProductLocation {
   @@id([productId, locationId])
   @@index([locationId])
   @@map("product_locations")
+}
+
+/// Per-location stock for one variation (GOURI `variation_location_details`).
+///
+/// This is the stock ledger's HEAD — the running balance every stock movement adjusts. Nothing
+/// writes it yet: opening stock, purchases, sells, transfers and adjustments all arrive with the
+/// transaction core. Until then every `qtyAvailable` is 0 and the Stock Report reads honest zeroes.
+model VariationLocationDetail {
+  id                 Int     @id @default(autoincrement())
+  productId          Int     @map("product_id")
+  productVariationId Int     @map("product_variation_id")
+  variationId        Int     @map("variation_id")
+  locationId         Int     @map("location_id")
+  qtyAvailable       Decimal @default(0) @map("qty_available") @db.Decimal(22, 4)
+
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  product          Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productVariation ProductVariation @relation(fields: [productVariationId], references: [id], onDelete: Cascade)
+  variation        Variation        @relation(fields: [variationId], references: [id], onDelete: Cascade)
+  location         BusinessLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  // GOURI has NO unique key here, and its two mutators look the row up by different key sets
+  // (4 columns vs 3), so increments and decrements can land on different duplicate rows and the
+  // read side has to SUM() to paper over it. One row per (variation, location) makes that impossible.
+  @@unique([variationId, locationId])
+  @@index([productId])
+  @@index([locationId])
+  @@map("variation_location_details")
 }
 
 /// Files attached to any record (GOURI `media`, a polymorphic morph table).
@@ -1614,8 +1654,9 @@ model ProductVariation {
   createdAt           DateTime? @default(now()) @map("created_at")
   updatedAt           DateTime? @updatedAt @map("updated_at")
 
-  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
-  variations Variation[]
+  product     Product                   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variations  Variation[]
+  stockLevels VariationLocationDetail[]
 
   @@index([productId])
   @@map("product_variations")
@@ -1642,6 +1683,8 @@ model Variation {
   product          Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
   productVariation ProductVariation      @relation(fields: [productVariationId], references: [id], onDelete: Cascade)
   groupPrices      VariationGroupPrice[]
+  stockLevels      VariationLocationDetail[]
+  purchaseLines    PurchaseLine[]
 
   @@index([productId])
   @@index([productVariationId])
@@ -1664,4 +1707,266 @@ model VariationGroupPrice {
   @@unique([variationId, priceGroupId])
   @@index([priceGroupId])
   @@map("variation_group_prices")
+}
+
+// ===================== TRANSACTION CORE ====================================
+// Source of truth: GOURI_DEV `transactions` (base migration + ~50 alters), `purchase_lines`,
+// `transaction_payments`, plus PurchaseController / ProductUtil / TransactionUtil.
+//
+// GOURI keeps EVERY business document in one `transactions` table switched by `type` — purchases,
+// sells, returns, transfers, expenses, payroll, stock adjustments. We keep that shape (every report,
+// ledger and payment path in the app depends on it) but carry only the columns the shipped modules
+// actually use: the shared core + the purchase family. Sell/payroll/manufacturing columns are added
+// by their own migrations when those modules land, instead of shipping ~45 permanently-NULL columns.
+//
+// Deliberate fixes to GOURI's schema, each verified as a defect:
+//  - `type`/`status` are real enums here. GOURI degraded both to VARCHAR(191), leaving the
+//    discriminator on its most important table with zero DB-level validation.
+//  - `isApproved`/`approvedBy`/`approvedAt` are properly modelled. **GOURI has NO migration for
+//    them at all** — they were added by hand to the live DB, so a fresh `migrate` yields a broken
+//    app, yet they gate every stock increment.
+//  - `exchangeRate` defaults to 1. GOURI's default is 0 — "multiply every amount by zero" — and the
+//    code defends with `!empty(...) ? ... : 1` at every call site.
+//  - `paymentStatus` is NOT NULL (GOURI silently dropped that when widening the enum).
+//  - Card PAN / expiry / CVV columns are NOT ported. GOURI stores raw card numbers and CVV in clear
+//    text and actively writes them; that is a PCI violation, not a feature.
+//  - `ref_no` is unique per business. GOURI has no unique index and increments its counter with a
+//    non-atomic read-modify-write, so concurrent saves collide.
+
+/// What business event a transaction row represents (GOURI `transactions.type`).
+/// The full set is declared up front so adding a module never needs an enum migration.
+enum TransactionType {
+  PURCHASE          @map("purchase")
+  PURCHASE_ORDER    @map("purchase_order")
+  PURCHASE_RETURN   @map("purchase_return")
+  PURCHASE_TRANSFER @map("purchase_transfer")
+  OPENING_STOCK     @map("opening_stock")
+  SELL              @map("sell")
+  SELL_RETURN       @map("sell_return")
+  SELL_TRANSFER     @map("sell_transfer")
+  SALES_ORDER       @map("sales_order")
+  OPENING_BALANCE   @map("opening_balance")
+  EXPENSE           @map("expense")
+  EXPENSE_REFUND    @map("expense_refund")
+  STOCK_ADJUSTMENT  @map("stock_adjustment")
+  PAYROLL           @map("payroll")
+}
+
+/// Document lifecycle. GOURI uses ONE column for two disjoint domains: a purchase may only be
+/// received/pending/ordered (`Util::orderStatuses`), a sell only draft/final. Both live here; the
+/// service layer enforces which set applies to which type.
+enum TransactionStatus {
+  RECEIVED @map("received")
+  PENDING  @map("pending")
+  ORDERED  @map("ordered")
+  DRAFT    @map("draft")
+  FINAL    @map("final")
+}
+
+enum DiscountType {
+  FIXED      @map("fixed")
+  PERCENTAGE @map("percentage")
+}
+
+/// One business document. See the header note for why this is a single table.
+model Transaction {
+  id         Int             @id @default(autoincrement())
+  businessId Int             @map("business_id")
+  locationId Int             @map("location_id")
+  type       TransactionType
+  status     TransactionStatus
+
+  /// Supplier for a purchase, customer for a sell. Optional because expenses have neither.
+  contactId Int? @map("contact_id")
+
+  /// Human reference, e.g. `PO2026/0007`. Unique per business — GOURI allows duplicates.
+  refNo           String   @map("ref_no") @db.VarChar(191)
+  transactionDate DateTime @map("transaction_date")
+
+  // ── money ────────────────────────────────────────────
+  /// Σ of line totals INCLUDING per-line tax, before the order-level discount and tax.
+  /// GOURI calls this `total_before_tax`, which is simply wrong — its own form posts the
+  /// after-line-tax subtotal into it, and its display screens recompute the real pre-tax figure
+  /// from the lines. Named honestly here; the DB column keeps GOURI's name for portability.
+  lineSubtotal   Decimal       @default(0) @map("total_before_tax") @db.Decimal(22, 4)
+  taxRateId      Int?          @map("tax_id")
+  taxAmount      Decimal       @default(0) @map("tax_amount") @db.Decimal(22, 4)
+  discountType   DiscountType? @map("discount_type")
+  /// A flat amount when `discountType` is FIXED, a percentage NUMBER when PERCENTAGE.
+  discountAmount Decimal       @default(0) @map("discount_amount") @db.Decimal(22, 4)
+
+  shippingDetails String?  @map("shipping_details") @db.VarChar(191)
+  shippingCharges Decimal  @default(0) @map("shipping_charges") @db.Decimal(22, 4)
+  /// Landed costs beyond shipping (freight, duty…). GOURI hard-caps these at four numbered column
+  /// pairs; JSON keeps it open without 8 more columns: `[{ name, amount }]`.
+  additionalExpenses Json? @map("additional_expenses")
+
+  /// The grand total, in BASE currency. Always recomputed server-side — GOURI trusts the client's.
+  finalTotal    Decimal       @default(0) @map("final_total") @db.Decimal(22, 4)
+  paymentStatus PaymentStatus @default(DUE) @map("payment_status")
+
+  // ── credit terms ─────────────────────────────────────
+  payTermNumber Int?         @map("pay_term_number")
+  payTermType   PayTermType? @map("pay_term_type")
+
+  // ── purchase approval ────────────────────────────────
+  /// Stock only posts for an APPROVED, RECEIVED purchase. Defaults to true so the common case just
+  /// works: in GOURI the field renders only for users holding `purchase.approve`, so everyone else
+  /// silently saved `is_approved = null` and their stock never moved.
+  isApproved Boolean   @default(true) @map("is_approved")
+  approvedBy Int?      @map("approved_by")
+  approvedAt DateTime? @map("approved_at")
+
+  // ── foreign-currency purchases ───────────────────────
+  /// Rate the amounts were converted FROM. Stored amounts are always base currency.
+  exchangeRate Decimal @default(1) @map("exchange_rate") @db.Decimal(20, 4)
+
+  // ── links between documents ──────────────────────────
+  /// A return points at the document it reverses.
+  returnParentId Int? @map("return_parent_id")
+  /// The incoming leg of a stock transfer points at the outgoing one.
+  transferParentId Int? @map("transfer_parent_id")
+
+  additionalNotes String? @map("additional_notes") @db.Text
+  staffNote       String? @map("staff_note") @db.Text
+  document        String? @db.VarChar(500)
+
+  customField1 String? @map("custom_field_1") @db.VarChar(191)
+  customField2 String? @map("custom_field_2") @db.VarChar(191)
+  customField3 String? @map("custom_field_3") @db.VarChar(191)
+  customField4 String? @map("custom_field_4") @db.VarChar(191)
+
+  createdBy Int       @map("created_by")
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  business      Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  location      BusinessLocation     @relation(fields: [locationId], references: [id])
+  contact       Contact?             @relation(fields: [contactId], references: [id])
+  taxRate       TaxRate?             @relation(fields: [taxRateId], references: [id])
+  purchaseLines PurchaseLine[]
+  payments      TransactionPayment[]
+  /// A return and the document it reverses.
+  returnParent  Transaction?         @relation("TransactionReturn", fields: [returnParentId], references: [id])
+  returns       Transaction[]        @relation("TransactionReturn")
+
+  // Every list is "this tenant's documents of this type, newest first".
+  @@unique([businessId, refNo])
+  @@index([businessId, type, transactionDate(sort: Desc)])
+  @@index([businessId, type, status])
+  @@index([contactId])
+  @@index([locationId])
+  @@index([returnParentId])
+  @@map("transactions")
+}
+
+/// One received line of a purchase — and the stock LOT it created.
+///
+/// Its four consumption counters are what make FIFO possible: remaining = quantity − (sold +
+/// adjusted + returned + mfgUsed), exactly as GOURI's `PurchaseLine::getQuantityRemainingAttribute`.
+model PurchaseLine {
+  id            Int @id @default(autoincrement())
+  transactionId Int @map("transaction_id")
+  productId     Int @map("product_id")
+  variationId   Int @map("variation_id")
+
+  /// Received quantity, always in the product's BASE unit (sub-unit input is multiplied out).
+  quantity Decimal @default(0) @db.Decimal(22, 4)
+  /// The unit the user actually typed in, when it wasn't the base unit.
+  subUnitId Int? @map("sub_unit_id")
+  secondaryUnitQuantity Decimal @default(0) @map("secondary_unit_quantity") @db.Decimal(22, 4)
+
+  // ── how much of this lot is gone ─────────────────────
+  quantitySold     Decimal @default(0) @map("quantity_sold") @db.Decimal(22, 4)
+  quantityAdjusted Decimal @default(0) @map("quantity_adjusted") @db.Decimal(22, 4)
+  quantityReturned Decimal @default(0) @map("quantity_returned") @db.Decimal(22, 4)
+  mfgQuantityUsed  Decimal @default(0) @map("mfg_quantity_used") @db.Decimal(22, 4)
+
+  // ── unit prices, all in BASE currency, per BASE unit ──
+  /// List price before the line discount.
+  ppWithoutDiscount Decimal @default(0) @map("pp_without_discount") @db.Decimal(22, 4)
+  /// Widened from GOURI's decimal(5,2) — the only money-ish column it left at 2dp.
+  discountPercent   Decimal @default(0) @map("discount_percent") @db.Decimal(22, 4)
+  /// After the line discount, before tax.
+  purchasePrice     Decimal @default(0) @map("purchase_price") @db.Decimal(22, 4)
+  /// Tax for ONE unit, not for the line (GOURI's meaning — easy to misread).
+  itemTax           Decimal @default(0) @map("item_tax") @db.Decimal(22, 4)
+  purchasePriceIncTax Decimal @default(0) @map("purchase_price_inc_tax") @db.Decimal(22, 4)
+  taxRateId         Int?    @map("tax_id")
+
+  lotNumber String?   @map("lot_number") @db.VarChar(191)
+  mfgDate   DateTime? @map("mfg_date") @db.Date
+  expDate   DateTime? @map("exp_date") @db.Date
+
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  product     Product     @relation(fields: [productId], references: [id])
+  variation   Variation   @relation(fields: [variationId], references: [id])
+  taxRate     TaxRate?    @relation(fields: [taxRateId], references: [id])
+
+  @@index([transactionId])
+  @@index([variationId])
+  @@index([productId])
+  // FIFO consumption reads "the oldest lots of this variation that still have stock".
+  @@index([variationId, expDate])
+  @@index([lotNumber])
+  @@map("purchase_lines")
+}
+
+/// Money received or paid against a document (GOURI `transaction_payments`).
+model TransactionPayment {
+  id         Int  @id @default(autoincrement())
+  businessId Int  @map("business_id")
+  /// Null for a contact-level advance that is not yet allocated to any document.
+  transactionId Int? @map("transaction_id")
+
+  amount Decimal @default(0) @db.Decimal(22, 4)
+  /// cash | card | cheque | bank_transfer | advance | other | custom_pay_1..7 — validated in code,
+  /// as in GOURI, so a business can rename its custom methods without a migration.
+  method String  @db.VarChar(191)
+  /// The Payment Account this moved through. FK arrives with the Payment Accounts module.
+  accountId Int? @map("account_id")
+
+  /// Human reference, e.g. `PP2026/0012`.
+  paymentRefNo String   @map("payment_ref_no") @db.VarChar(191)
+  paidOn       DateTime @map("paid_on")
+
+  /// True when the money moved the other way (change given, refund).
+  isReturn  Boolean @default(false) @map("is_return")
+  /// Credited to the contact's advance balance rather than a document.
+  isAdvance Boolean @default(false) @map("is_advance")
+  /// The contact this payment belongs to — set even when transactionId is null.
+  paymentFor Int? @map("payment_for")
+  /// A lump payment allocated across several documents: children point at the parent.
+  parentId Int? @map("parent_id")
+
+  // Card PAN / expiry / CVV are deliberately NOT stored — see the header note.
+  cardTransactionNumber String? @map("card_transaction_number") @db.VarChar(191)
+  cardHolderName        String? @map("card_holder_name") @db.VarChar(191)
+  /// Brand only (visa, mastercard…), never a card number.
+  cardType              String? @map("card_type") @db.VarChar(191)
+  chequeNumber          String? @map("cheque_number") @db.VarChar(191)
+  bankAccountNumber     String? @map("bank_account_number") @db.VarChar(191)
+  transactionNo         String? @map("transaction_no") @db.VarChar(191)
+
+  note      String?   @db.Text
+  document  String?   @db.VarChar(500)
+  createdBy Int?      @map("created_by")
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  business    Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  transaction Transaction?         @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  parent      TransactionPayment?  @relation("PaymentAllocation", fields: [parentId], references: [id])
+  children    TransactionPayment[] @relation("PaymentAllocation")
+
+  @@unique([businessId, paymentRefNo])
+  @@index([transactionId])
+  @@index([businessId, paidOn])
+  @@index([paymentFor])
+  @@index([accountId])
+  @@index([parentId])
+  @@map("transaction_payments")
 }

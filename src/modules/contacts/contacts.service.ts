@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { Prisma, type Contact, type PayTermType } from '@prisma/client';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import { formatContactId, toPayTermType, typesFor } from './contacts.constants';
+import { round4 } from '../purchases/purchase.calc';
 import type { ListContactsQueryDto } from './dto/list-contacts.query';
 import type { SaveContactDto } from './dto/save-contact.dto';
 
@@ -28,8 +29,8 @@ export class ContactsService {
 
   /**
    * GET /contacts — shared suppliers/customers list (server-side paginated).
-   * NOTE: money columns (opening balance, purchase/sell due, return due, reward points) are
-   * transaction-derived and returned as `null` until the transaction-core module lands.
+   * NOTE: purchase due is now derived from real purchases. The rest of the money columns (opening
+   * balance, sell due, return dues, reward points) stay `null` until their modules land.
    */
   async findAll(businessId: number, query: ListContactsQueryDto) {
     const search = query.search.trim();
@@ -67,6 +68,26 @@ export class ContactsService {
       this.prisma.contact.count({ where }),
     ]);
 
+    // What each supplier is owed on purchases. Derived, never stored: total billed minus total
+    // paid, exactly as GOURI computes its "Payment Due" column at read time.
+    const contactIds = rows.map((c) => c.id);
+    const [billed, paid] = contactIds.length
+      ? await Promise.all([
+          this.prisma.transaction.groupBy({
+            by: ['contactId'],
+            where: { businessId, type: 'PURCHASE', contactId: { in: contactIds } },
+            _sum: { finalTotal: true },
+          }),
+          this.prisma.transactionPayment.groupBy({
+            by: ['paymentFor'],
+            where: { businessId, paymentFor: { in: contactIds }, transaction: { type: 'PURCHASE' } },
+            _sum: { amount: true },
+          }),
+        ])
+      : [[], []];
+    const billedBy = new Map(billed.map((b) => [b.contactId, Number(b._sum.finalTotal ?? 0)]));
+    const paidBy = new Map(paid.map((p) => [p.paymentFor, Number(p._sum.amount ?? 0)]));
+
     const data = rows.map((c) => ({
       id: c.id,
       contactId: c.contactId ?? '',
@@ -91,9 +112,10 @@ export class ContactsService {
         c.customField1, c.customField2, c.customField3, c.customField4, c.customField5,
         c.customField6, c.customField7, c.customField8, c.customField9, c.customField10,
       ].map((v) => v ?? ''),
-      // Deferred (transaction-derived) — surfaced as null so the UI shows "—".
+      // Live now that purchases exist.
+      totalPurchaseDue: round4((billedBy.get(c.id) ?? 0) - (paidBy.get(c.id) ?? 0)),
+      // Still transaction-core work — surfaced as null so the UI shows "—", never a fake 0.
       openingBalance: null as number | null,
-      totalPurchaseDue: null as number | null,
       totalPurchaseReturnDue: null as number | null,
       totalSaleDue: null as number | null,
       totalSellReturnDue: null as number | null,
