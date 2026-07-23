@@ -23,6 +23,7 @@ import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import type { AccessPayload } from '../auth/token.service';
 import { ContactsService } from './contacts.service';
 import { ContactsImportService } from './import/contacts-import.service';
+import { ContactLedgerQueryDto } from './dto/contact-ledger.query';
 import { ListContactsQueryDto } from './dto/list-contacts.query';
 import { SaveContactDto } from './dto/save-contact.dto';
 
@@ -120,6 +121,17 @@ export class ContactsController {
   @HttpCode(200)
   massDelete(@CurrentUser() user: AccessPayload, @Body() body: { ids: number[] }) {
     return this.contacts.massDestroy(user.businessId as number, body.ids ?? []);
+  }
+
+  /** The contact's running statement. Must precede ':id' only if it were bare — but it's a sub-path. */
+  @Get(':id/ledger')
+  @RequirePermissions(...VIEW)
+  ledger(
+    @CurrentUser() user: AccessPayload,
+    @Param('id', ParseIntPipe) id: number,
+    @Query() query: ContactLedgerQueryDto,
+  ) {
+    return this.contacts.ledger(user, id, query);
   }
 
   @Get(':id')

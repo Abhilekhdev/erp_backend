@@ -1,17 +1,91 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, type Contact, type PayTermType } from '@prisma/client';
 import { PrismaService } from '../../infra/prisma/prisma.service';
+import { AbilityService } from '../../common/services/ability.service';
+import { ReferenceNumberService } from '../../common/services/reference-number.service';
 import { formatContactId, toPayTermType, typesFor } from './contacts.constants';
-import { round4 } from '../purchases/purchase.calc';
+import { paymentStatusFor, round4 } from '../purchases/purchase.calc';
+import type { AccessPayload } from '../auth/token.service';
+import type { ContactLedgerQueryDto } from './dto/contact-ledger.query';
 import type { ListContactsQueryDto } from './dto/list-contacts.query';
 import type { SaveContactDto } from './dto/save-contact.dto';
 
 const blank = (v?: string | null): string | null => (v == null || v === '' ? null : v);
 const toPayTerm = (v?: string | null): PayTermType | null => toPayTermType(v);
 
+/** Human labels for the ledger's transaction rows. */
+const LEDGER_LABEL: Record<string, string> = {
+  SELL: 'Sale',
+  PURCHASE: 'Purchase',
+  SELL_RETURN: 'Sell return',
+  PURCHASE_RETURN: 'Purchase return',
+  OPENING_BALANCE: 'Opening balance',
+};
+
 @Injectable()
 export class ContactsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly refs: ReferenceNumberService,
+    private readonly ability: AbilityService,
+  ) {}
+
+  /**
+   * Opening balance is what a contact already owed (customer) or was owed (supplier) before the
+   * system started. GOURI never stores it on `contacts` — it writes a `transactions` row of
+   * `type='opening_balance'`, and so do we. `remaining` is the figure the edit form shows (gross
+   * minus anything already paid); on save we reconstruct the gross so a part-payment isn't lost.
+   */
+  private async syncOpeningBalance(
+    tx: Prisma.TransactionClient,
+    businessId: number,
+    contactId: number,
+    remaining: number | null | undefined,
+    createdBy: number,
+  ) {
+    const value = round4(Number(remaining) || 0);
+    const existing = await tx.transaction.findFirst({
+      where: { businessId, contactId, type: 'OPENING_BALANCE' },
+      select: { id: true },
+    });
+
+    if (existing) {
+      const agg = await tx.transactionPayment.aggregate({ where: { transactionId: existing.id }, _sum: { amount: true } });
+      const paid = Number(agg._sum.amount ?? 0);
+      const gross = round4(value + paid); // form value is the remaining; add paid back to gross
+      await tx.transaction.update({
+        where: { id: existing.id },
+        // GOURI updates only final_total on edit, never total_before_tax — kept.
+        data: { finalTotal: gross, paymentStatus: paymentStatusFor(gross, paid) },
+      });
+      return;
+    }
+    if (value <= 0) return;
+
+    // A fresh opening balance: dated now, at the business's FIRST location (GOURI's `->first()`).
+    const location = await tx.businessLocation.findFirst({
+      where: { businessId, deletedAt: null },
+      orderBy: { id: 'asc' },
+      select: { id: true },
+    });
+    if (!location) return; // no location yet — nothing to hang it on
+    const refNo = await this.refs.generate(businessId, 'opening_balance', 'OB');
+    await tx.transaction.create({
+      data: {
+        businessId,
+        locationId: location.id,
+        contactId,
+        type: 'OPENING_BALANCE',
+        status: 'FINAL',
+        paymentStatus: 'DUE',
+        refNo,
+        transactionDate: new Date(),
+        lineSubtotal: value,
+        finalTotal: value,
+        createdBy,
+      },
+    });
+  }
 
   private addressOf(c: {
     addressLine1: string | null;
@@ -71,7 +145,9 @@ export class ContactsService {
     // What each supplier is owed on purchases. Derived, never stored: total billed minus total
     // paid, exactly as GOURI computes its "Payment Due" column at read time.
     const contactIds = rows.map((c) => c.id);
-    const [billed, paid] = contactIds.length
+    // Each due figure is billed minus paid, derived at read time exactly as GOURI does — nothing is
+    // stored. Only FINAL sells count (drafts/quotations are excluded), mirroring GOURI's queries.
+    const [purchBilled, purchPaid, sellBilled, sellPaid, retBilled, retPaid, obBilled] = contactIds.length
       ? await Promise.all([
           this.prisma.transaction.groupBy({
             by: ['contactId'],
@@ -83,10 +159,55 @@ export class ContactsService {
             where: { businessId, paymentFor: { in: contactIds }, transaction: { type: 'PURCHASE' } },
             _sum: { amount: true },
           }),
+          this.prisma.transaction.groupBy({
+            by: ['contactId'],
+            where: { businessId, type: 'SELL', status: 'FINAL', contactId: { in: contactIds } },
+            _sum: { finalTotal: true },
+          }),
+          this.prisma.transactionPayment.groupBy({
+            by: ['paymentFor'],
+            where: {
+              businessId,
+              paymentFor: { in: contactIds },
+              transaction: { type: 'SELL', status: 'FINAL' },
+            },
+            _sum: { amount: true },
+          }),
+          this.prisma.transaction.groupBy({
+            by: ['contactId'],
+            where: { businessId, type: 'SELL_RETURN', contactId: { in: contactIds } },
+            _sum: { finalTotal: true },
+          }),
+          this.prisma.transactionPayment.groupBy({
+            by: ['paymentFor'],
+            where: { businessId, paymentFor: { in: contactIds }, transaction: { type: 'SELL_RETURN' } },
+            _sum: { amount: true },
+          }),
+          // Opening balance is a standalone column (GOURI does NOT fold it into purchase/sale due).
+          this.prisma.transaction.groupBy({
+            by: ['contactId'],
+            where: { businessId, type: 'OPENING_BALANCE', contactId: { in: contactIds } },
+            _sum: { finalTotal: true },
+          }),
         ])
-      : [[], []];
-    const billedBy = new Map(billed.map((b) => [b.contactId, Number(b._sum.finalTotal ?? 0)]));
-    const paidBy = new Map(paid.map((p) => [p.paymentFor, Number(p._sum.amount ?? 0)]));
+      : [[], [], [], [], [], [], []];
+    const sumBy = (
+      list: { contactId?: number | null; paymentFor?: number | null; _sum: { finalTotal?: unknown; amount?: unknown } }[],
+      key: 'finalTotal' | 'amount',
+    ) =>
+      new Map(
+        list.map((r) => [
+          (r.contactId ?? r.paymentFor) as number,
+          Number((r._sum as Record<string, unknown>)[key] ?? 0),
+        ]),
+      );
+    const billedBy = sumBy(purchBilled, 'finalTotal');
+    const paidBy = sumBy(purchPaid, 'amount');
+    const sellBilledBy = sumBy(sellBilled, 'finalTotal');
+    const sellPaidBy = sumBy(sellPaid, 'amount');
+    const retBilledBy = sumBy(retBilled, 'finalTotal');
+    const retPaidBy = sumBy(retPaid, 'amount');
+    const obBy = sumBy(obBilled, 'finalTotal');
 
     const data = rows.map((c) => ({
       id: c.id,
@@ -112,13 +233,14 @@ export class ContactsService {
         c.customField1, c.customField2, c.customField3, c.customField4, c.customField5,
         c.customField6, c.customField7, c.customField8, c.customField9, c.customField10,
       ].map((v) => v ?? ''),
-      // Live now that purchases exist.
+      // Derived from real transactions (billed − paid). Live now that purchases and sells exist.
       totalPurchaseDue: round4((billedBy.get(c.id) ?? 0) - (paidBy.get(c.id) ?? 0)),
-      // Still transaction-core work — surfaced as null so the UI shows "—", never a fake 0.
-      openingBalance: null as number | null,
+      totalSaleDue: round4((sellBilledBy.get(c.id) ?? 0) - (sellPaidBy.get(c.id) ?? 0)),
+      totalSellReturnDue: round4((retBilledBy.get(c.id) ?? 0) - (retPaidBy.get(c.id) ?? 0)),
+      // Still their own modules — surfaced as null so the UI shows "—", never a fake 0.
+      // Gross opening balance, its own column — GOURI shows it standalone, not merged into due.
+      openingBalance: round4(obBy.get(c.id) ?? 0),
       totalPurchaseReturnDue: null as number | null,
-      totalSaleDue: null as number | null,
-      totalSellReturnDue: null as number | null,
       rewardPoints: null as number | null,
     }));
 
@@ -158,7 +280,166 @@ export class ContactsService {
       },
     });
     if (!c) throw new NotFoundException('Contact not found');
-    return this.shapeDetail(c);
+    // The edit form shows opening balance as what is STILL owed (gross minus paid), the same
+    // figure syncOpeningBalance expects back on save.
+    const ob = await this.prisma.transaction.findFirst({
+      where: { businessId, contactId: id, type: 'OPENING_BALANCE' },
+      select: { finalTotal: true, payments: { select: { amount: true } } },
+    });
+    const obRemaining = ob
+      ? round4(Number(ob.finalTotal) - ob.payments.reduce((s, p) => s + Number(p.amount), 0))
+      : 0;
+    return { ...this.shapeDetail(c), openingBalance: obRemaining };
+  }
+
+  /**
+   * The contact ledger — a running statement (GOURI's `format_1`): every transaction and payment as
+   * a debit or credit line, a running balance, and a summary header. Debit/credit follow GOURI's
+   * `getLedgerDetails`: a sell debits a customer (a receivable), a purchase credits a supplier, a
+   * payment against a sale/opening-balance credits it back, etc. Read-only.
+   */
+  async ledger(user: AccessPayload, contactId: number, query: ContactLedgerQueryDto) {
+    const businessId = user.businessId as number;
+    const contact = await this.prisma.contact.findFirst({
+      where: { id: contactId, businessId, deletedAt: null },
+      select: { id: true, type: true, name: true, supplierBusinessName: true, balance: true },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+    if (!(await this.ability.can(user, 'supplier.view')) && !(await this.ability.can(user, 'customer.view'))) {
+      // view_own falls through to the same read; per-contact scoping isn't modelled here.
+    }
+
+    const end = query.dateTo ? new Date(new Date(query.dateTo).setHours(23, 59, 59, 999)) : undefined;
+    const start = query.dateFrom ? new Date(new Date(query.dateFrom).setHours(0, 0, 0, 0)) : undefined;
+    const locationFilter = query.locationId ? { locationId: query.locationId } : {};
+
+    // Contact-affecting documents. A sell only counts once final; drafts never.
+    const txns = await this.prisma.transaction.findMany({
+      where: {
+        businessId,
+        contactId,
+        ...locationFilter,
+        type: { in: ['SELL', 'PURCHASE', 'SELL_RETURN', 'PURCHASE_RETURN', 'OPENING_BALANCE'] },
+        status: { not: 'DRAFT' },
+        ...(end ? { transactionDate: { lte: end } } : {}),
+      },
+      select: { id: true, type: true, status: true, refNo: true, transactionDate: true, finalTotal: true, paymentStatus: true, location: { select: { name: true } } },
+      orderBy: { transactionDate: 'asc' },
+    });
+    const payments = await this.prisma.transactionPayment.findMany({
+      where: {
+        businessId,
+        paymentFor: contactId,
+        transaction: { type: { in: ['SELL', 'PURCHASE', 'SELL_RETURN', 'PURCHASE_RETURN', 'OPENING_BALANCE'] } },
+        ...(end ? { paidOn: { lte: end } } : {}),
+      },
+      select: { id: true, amount: true, method: true, paymentRefNo: true, paidOn: true, isReturn: true, note: true, transaction: { select: { type: true, refNo: true, location: { select: { name: true } } } } },
+      orderBy: { paidOn: 'asc' },
+    });
+
+    const isCustomerSide = contact.type === 'customer' || contact.type === 'both';
+
+    type Row = { date: Date; refNo: string; type: string; label: string; location: string; paymentStatus: string | null; method: string | null; debit: number; credit: number; note: string; balance?: number };
+    const rows: Row[] = [];
+
+    for (const t of txns) {
+      if (t.type === 'SELL' && t.status !== 'FINAL') continue;
+      let debit = 0;
+      let credit = 0;
+      if (t.type === 'SELL' || t.type === 'PURCHASE_RETURN') debit = Number(t.finalTotal);
+      else if (t.type === 'PURCHASE' || t.type === 'SELL_RETURN') credit = Number(t.finalTotal);
+      else if (t.type === 'OPENING_BALANCE') {
+        // GOURI: debit for a customer, credit for a supplier. We treat `both` as customer-side.
+        if (isCustomerSide) debit = Number(t.finalTotal);
+        else credit = Number(t.finalTotal);
+      }
+      rows.push({
+        date: t.transactionDate,
+        refNo: t.refNo,
+        type: t.type.toLowerCase(),
+        label: LEDGER_LABEL[t.type] ?? t.type,
+        location: t.location.name,
+        paymentStatus: t.type === 'OPENING_BALANCE' ? null : t.paymentStatus.toLowerCase(),
+        method: null,
+        debit: round4(debit),
+        credit: round4(credit),
+        note: '',
+      });
+    }
+
+    for (const p of payments) {
+      const pt = p.transaction?.type;
+      let debit = 0;
+      let credit = 0;
+      // A payment against a purchase or a sell-return is money we PAID (debit). A payment against a
+      // sale, purchase-return or opening balance is money RECEIVED (credit). is_return flips it.
+      const receivedSide = pt === 'SELL' || pt === 'PURCHASE_RETURN' || pt === 'OPENING_BALANCE';
+      if (receivedSide) {
+        if (p.isReturn) debit = Number(p.amount);
+        else credit = Number(p.amount);
+      } else {
+        if (p.isReturn) credit = Number(p.amount);
+        else debit = Number(p.amount);
+      }
+      rows.push({
+        date: p.paidOn,
+        refNo: p.paymentRefNo ?? '',
+        type: 'payment',
+        label: 'Payment',
+        location: p.transaction?.location?.name ?? '',
+        paymentStatus: null,
+        method: p.method,
+        debit: round4(debit),
+        credit: round4(credit),
+        note: [p.note, p.transaction?.refNo ? `For ${p.transaction.refNo}` : ''].filter(Boolean).join(' · '),
+      });
+    }
+
+    rows.sort((a, b) => a.date.getTime() - b.date.getTime() || a.type.localeCompare(b.type));
+
+    // Everything before the window is folded into the opening running balance.
+    let beginningBalance = 0;
+    const windowRows: Row[] = [];
+    for (const r of rows) {
+      if (start && r.date < start) beginningBalance = round4(beginningBalance + r.credit - r.debit);
+      else windowRows.push(r);
+    }
+
+    let bal = beginningBalance;
+    for (const r of windowRows) {
+      bal = round4(bal + r.credit - r.debit);
+      r.balance = bal;
+    }
+
+    // Summary figures (over the whole window, all-time when no start).
+    const listed = windowRows;
+    const totalInvoice = round4(listed.filter((r) => r.type === 'sell').reduce((s, r) => s + r.debit, 0) - listed.filter((r) => r.type === 'sell_return').reduce((s, r) => s + r.credit, 0));
+    const totalPurchase = round4(listed.filter((r) => r.type === 'purchase').reduce((s, r) => s + r.credit, 0) - listed.filter((r) => r.type === 'purchase_return').reduce((s, r) => s + r.debit, 0));
+    const totalPaid = round4(listed.filter((r) => r.type === 'payment').reduce((s, r) => s + r.debit + r.credit, 0));
+
+    return {
+      contact: { id: contact.id, name: contact.name || contact.supplierBusinessName || '', type: contact.type },
+      openingBalance: beginningBalance,
+      totalInvoice,
+      totalPurchase,
+      totalPaid,
+      advanceBalance: Number(contact.balance),
+      // Positive => the contact owes us (a customer receivable); negative => we owe them.
+      balanceDue: round4(-bal),
+      rows: windowRows.map((r) => ({
+        date: r.date,
+        refNo: r.refNo,
+        type: r.type,
+        label: r.label,
+        location: r.location,
+        paymentStatus: r.paymentStatus,
+        method: r.method,
+        debit: r.debit || null,
+        credit: r.credit || null,
+        balance: r.balance ?? 0,
+        note: r.note,
+      })),
+    };
   }
 
   private shapeDetail(
@@ -340,6 +621,7 @@ export class ContactsService {
         },
       });
       await this.syncAssignedUsers(tx, contact.id, dto.assigned_to_users ?? []);
+      await this.syncOpeningBalance(tx, businessId, contact.id, dto.opening_balance, createdBy);
       return contact.id;
     });
     return this.findOne(businessId, id);
@@ -364,6 +646,9 @@ export class ContactsService {
       if (dto.assigned_to_users !== undefined) {
         await tx.userContactAccess.deleteMany({ where: { contactId: id } });
         await this.syncAssignedUsers(tx, id, dto.assigned_to_users);
+      }
+      if (dto.opening_balance !== undefined) {
+        await this.syncOpeningBalance(tx, businessId, id, dto.opening_balance, existing.createdBy);
       }
     });
     return this.findOne(businessId, id);

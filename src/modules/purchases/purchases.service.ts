@@ -5,6 +5,7 @@ import { AuditService } from '../../common/audit/audit.service';
 import { AbilityService } from '../../common/services/ability.service';
 import { ReferenceNumberService } from '../../common/services/reference-number.service';
 import { StockService, type StockMovement } from '../../common/services/stock.service';
+import { AccountPostingService } from '../accounts/account-posting.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import type { AccessPayload } from '../auth/token.service';
 import type {
@@ -31,6 +32,7 @@ export class PurchasesService {
     private readonly refs: ReferenceNumberService,
     private readonly audit: AuditService,
     private readonly ability: AbilityService,
+    private readonly accountPosting: AccountPostingService,
   ) {}
 
   /** Stock exists only for a RECEIVED, APPROVED purchase — GOURI's gate, kept. */
@@ -610,15 +612,17 @@ export class PurchasesService {
       const amount = Number(p.amount) || 0;
       if (amount <= 0) continue; // GOURI skips zero-amount rows too — a 0 payment is not a payment
       const refNo = await this.refs.generate(businessId, 'purchase_payment', 'PP');
-      await tx.transactionPayment.create({
+      const accountId = (p.account_id as number) ?? null;
+      const paidOn = p.paid_on ? new Date(String(p.paid_on)) : new Date();
+      const payment = await tx.transactionPayment.create({
         data: {
           businessId,
           transactionId,
           amount,
           method: String(p.method),
-          accountId: (p.account_id as number) ?? null,
+          accountId,
           paymentRefNo: refNo,
-          paidOn: p.paid_on ? new Date(String(p.paid_on)) : new Date(),
+          paidOn,
           paymentFor: contactId,
           cardTransactionNumber: blank(p.card_transaction_number as string),
           cardHolderName: blank(p.card_holder_name as string),
@@ -629,6 +633,16 @@ export class PurchasesService {
           note: blank(p.note as string),
           createdBy: userId,
         },
+      });
+      // Post the matching account ledger row (debit — paying a supplier). No-op if no account chosen.
+      await this.accountPosting.postForPayment(tx, {
+        paymentId: payment.id,
+        accountId,
+        transactionId,
+        transactionType: 'purchase',
+        amount,
+        paidOn,
+        createdBy: userId,
       });
     }
   }
@@ -968,6 +982,8 @@ export class PurchasesService {
     if (!payment) throw new NotFoundException('Payment not found');
 
     await this.prisma.$transaction(async (tx) => {
+      // Remove the mirrored account ledger row first (the payment FK would otherwise orphan it).
+      await this.accountPosting.reverseForPayment(tx, paymentId);
       await tx.transactionPayment.delete({ where: { id: paymentId } });
       if (payment.transactionId) await this.syncPaymentStatus(tx, payment.transactionId);
     });

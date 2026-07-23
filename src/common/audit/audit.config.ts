@@ -42,6 +42,8 @@ export const AUDITED_MODELS: Record<string, AuditedModel> = {
   VariationTemplate: { label: 'Variation template', name: (r) => r.name },
   BusinessLocation: { label: 'Business location', name: (r) => r.name },
   BusinessSetting: { label: 'Business settings' },
+  ClaimReimbursement: { label: 'Claim', name: (r) => r.description },
+  ClaimReimbursementCategory: { label: 'Claim category', name: (r) => r.name },
   // Purchases are logged by the service, not the middleware: a purchase is a document plus its
   // lines plus its stock movements, and the generic hook would only see "Transaction updated"
   // with no diff — the same reason Product is `manual`.
@@ -50,6 +52,10 @@ export const AUDITED_MODELS: Record<string, AuditedModel> = {
   PurchaseRequisition: { label: 'Purchase requisition', manual: true },
   PurchaseOrder: { label: 'Purchase order', manual: true },
   PurchaseReturn: { label: 'Purchase return', manual: true },
+  OpeningStock: { label: 'Opening stock', manual: true },
+  Sell: { label: 'Sale', manual: true },
+  SalesOrder: { label: 'Sales order', manual: true },
+  SellReturn: { label: 'Sell return', manual: true },
   // Sell, StockTransfer and the rest join as they are built.
 };
 

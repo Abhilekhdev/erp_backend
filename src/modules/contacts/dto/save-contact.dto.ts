@@ -7,8 +7,8 @@ const optionalEmail = z.union([z.string().email('Invalid email'), z.literal('')]
 /**
  * Create/Update payload for a Contact — mirrors the fields collected by GOURI_DEV
  * ContactController@store/@update (`$request->only([...])` + credit_limit/is_export/export_*).
- * `opening_balance` is accepted for form parity but NOT persisted yet (deferred: legacy stores
- * it as a `transactions` row, built with the transaction-core module).
+ * `opening_balance` is stored as a `transactions` row (`type=opening_balance`), never on the
+ * contact — GOURI's model. On edit it is the REMAINING amount (gross minus anything paid).
  */
 export const saveContactSchema = z
   .object({

@@ -40,7 +40,7 @@ export const IMPORT_COLUMNS: ImportColumn[] = [
   { index: 6, header: 'BUSINESS NAME', key: 'supplier_business_name', requirement: 'documented-only', help: 'Required if contact type is Supplier or Both' },
   { index: 7, header: 'CONTACT ID', key: 'contact_id', requirement: 'optional', help: 'Leave blank to auto-generate. Must be unique.' },
   { index: 8, header: 'TAX NUMBER', key: 'tax_number', requirement: 'optional', help: '' },
-  { index: 9, header: 'OPENING BALANCE', key: 'opening_balance', requirement: 'optional', help: 'Not imported yet — arrives with the transactions module' },
+  { index: 9, header: 'OPENING BALANCE', key: 'opening_balance', requirement: 'optional', help: 'What the contact already owed (customer) or was owed (supplier) at start' },
   { index: 10, header: 'PAY TERM', key: 'pay_term_number', requirement: 'supplier', help: 'Number. Required if contact type is Supplier or Both' },
   { index: 11, header: 'PAY TERM PERIOD', key: 'pay_term_type', requirement: 'supplier', help: 'days or months. Required if contact type is Supplier or Both' },
   { index: 12, header: 'CREDIT LIMIT', key: 'credit_limit', requirement: 'optional', help: 'Applies to Customer / Both only' },

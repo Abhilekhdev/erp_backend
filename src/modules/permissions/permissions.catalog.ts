@@ -436,6 +436,16 @@ export const PERMISSION_CATALOG: PermGroup[] = [
     ],
   },
   {
+    key: 'wastage_type',
+    label: 'Wastage Types',
+    items: [
+      cb('wastage_type.view', 'View wastage types'),
+      cb('wastage_type.create', 'Create wastage types'),
+      cb('wastage_type.update', 'Update wastage types'),
+      cb('wastage_type.delete', 'Delete wastage types'),
+    ],
+  },
+  {
     key: 'bookings',
     label: 'Bookings',
     module: 'booking',

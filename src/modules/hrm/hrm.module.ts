@@ -5,6 +5,10 @@ import { AllowanceDeductionsController } from './allowance-deductions.controller
 import { AllowanceDeductionsService } from './allowance-deductions.service';
 import { AttendanceController } from './attendance.controller';
 import { AttendanceService } from './attendance.service';
+import { ClaimCategoriesController } from './claim-categories.controller';
+import { ClaimCategoriesService } from './claim-categories.service';
+import { ClaimsController } from './claims.controller';
+import { ClaimsService } from './claims.service';
 import { DepartmentsController } from './departments.controller';
 import { DepartmentsService } from './departments.service';
 import { DesignationsController } from './designations.controller';
@@ -42,6 +46,8 @@ import { ShiftsService } from './shifts.service';
     HrmSettingsController,
     AllowanceDeductionsController,
     PayrollController,
+    ClaimsController,
+    ClaimCategoriesController,
   ],
   providers: [
     HrmDashboardService,
@@ -58,6 +64,8 @@ import { ShiftsService } from './shifts.service';
     AllowanceDeductionsService,
     PayrollService,
     PayslipPdfService,
+    ClaimsService,
+    ClaimCategoriesService,
   ],
   exports: [DepartmentsService, DesignationsService, LeaveTypesService, LeavesService],
 })

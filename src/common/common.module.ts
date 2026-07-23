@@ -3,6 +3,7 @@ import { AuditService } from './audit/audit.service';
 import { AbilityService } from './services/ability.service';
 import { MailService } from './services/mail.service';
 import { ReferenceNumberService } from './services/reference-number.service';
+import { StockLookupService } from './services/stock-lookup.service';
 import { StockService } from './services/stock.service';
 import { StorageService } from './services/storage.service';
 
@@ -14,7 +15,7 @@ import { StorageService } from './services/storage.service';
  */
 @Global()
 @Module({
-  providers: [AbilityService, AuditService, ReferenceNumberService, MailService, StorageService, StockService],
-  exports: [AbilityService, AuditService, ReferenceNumberService, MailService, StorageService, StockService],
+  providers: [AbilityService, AuditService, ReferenceNumberService, MailService, StorageService, StockService, StockLookupService],
+  exports: [AbilityService, AuditService, ReferenceNumberService, MailService, StorageService, StockService, StockLookupService],
 })
 export class CommonModule {}

@@ -112,6 +112,14 @@ enum LeaveStatus {
   CANCELLED @map("cancelled") // rendered as "Rejected" in the UI (matches GOURI)
 }
 
+// Claim/reimbursement approval state. Legacy stored this as `is_approved` int
+// (0 = Pending, 1 = Approved, 2 = UnApproved); we keep the three states as an enum.
+enum ClaimStatus {
+  PENDING    @map("pending")
+  APPROVED   @map("approved")
+  UNAPPROVED @map("unapproved")
+}
+
 // Pay-component (allowance/deduction) classification — legacy `type` enum.
 enum AllowanceDeductionType {
   ALLOWANCE @map("allowance")
@@ -150,6 +158,13 @@ enum PaymentStatus {
 enum PayTermType {
   DAYS   @map("days")
   MONTHS @map("months")
+}
+
+// Recurring-expense cadence — legacy `transactions.recur_interval_type` enum.
+enum RecurIntervalType {
+  DAYS   @map("days")
+  MONTHS @map("months")
+  YEARS  @map("years")
 }
 
 // ===================== TENANCY =============================================
@@ -287,6 +302,9 @@ model Business {
   leaveTypes            LeaveType[]
   userLeaveBalances     UserLeaveBalance[]
   leaves                Leave[]
+  claimCategories       ClaimReimbursementCategory[]
+  claims                ClaimReimbursement[]
+  userClaims            UserClaimReimbursement[]
   holidays              Holiday[]
   activityCodes         ActivityCode[]
   allowanceDeductions   EssentialsAllowanceAndDeduction[]
@@ -314,8 +332,12 @@ model Business {
   productRacks          ProductRack[]
   transactions          Transaction[]
   transactionPayments   TransactionPayment[]
+  expenseCategories     ExpenseCategory[]
   barcodes              Barcode[]
   media                 Media[]
+  accounts              Account[]
+  accountTypes          AccountType[]
+  wastageTypes          WastageType[]
 
   @@index([currencyId])
   @@index([ownerId])
@@ -432,6 +454,75 @@ model Leave {
   @@index([userId])
   @@index([leaveTypeId])
   @@map("leaves")
+}
+
+// Claim/reimbursement category master (legacy `essentials_claim_and_reimbursement_categories`).
+// Self-referential: a `parentId` makes a row a sub-category. Mirrors ExpenseCategory.
+model ClaimReimbursementCategory {
+  id         Int       @id @default(autoincrement())
+  businessId Int       @map("business_id")
+  name       String    @db.VarChar(191)
+  code       String?   @db.VarChar(191)
+  parentId   Int?      @map("parent_id")
+  deletedAt  DateTime? @map("deleted_at")
+  createdAt  DateTime? @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  business Business                     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  parent   ClaimReimbursementCategory?  @relation("ClaimReimbursementCategoryTree", fields: [parentId], references: [id])
+  children ClaimReimbursementCategory[] @relation("ClaimReimbursementCategoryTree")
+  claims   ClaimReimbursement[]
+
+  @@index([businessId])
+  @@index([parentId])
+  @@map("claim_reimbursement_category")
+}
+
+// Employee expense claim / reimbursement (legacy `essentials_claim_reimbursement`). GOURI's
+// vestigial `type`/`amount_type` columns are dropped — every claim is a fixed cash amount.
+model ClaimReimbursement {
+  id             Int         @id @default(autoincrement())
+  businessId     Int         @map("business_id")
+  refNo          String?     @map("ref_no") @db.VarChar(191)
+  description    String      @db.VarChar(255)
+  amount         Decimal     @default(0) @db.Decimal(22, 4)
+  categoryId     Int?        @map("claim_category_id")
+  subCategoryId  Int?        @map("claim_sub_category_id")
+  applicableDate DateTime?   @map("applicable_date") @db.Date
+  document       String?     @db.VarChar(191)
+  status         ClaimStatus @default(PENDING)
+  statusNote     String?     @map("status_note") @db.Text
+  changedBy      Int?        @map("changed_by")
+  changedAt      DateTime?   @map("changed_at")
+  createdAt      DateTime?   @default(now()) @map("created_at")
+  updatedAt      DateTime?   @updatedAt @map("updated_at")
+
+  business  Business                    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  category  ClaimReimbursementCategory? @relation(fields: [categoryId], references: [id])
+  employees UserClaimReimbursement[]
+
+  @@index([businessId])
+  @@index([categoryId])
+  @@map("claim_reimbursement")
+}
+
+// Join between a claim and the employee(s) it belongs to (legacy `essentials_user_claim_reimbursement`).
+model UserClaimReimbursement {
+  id                   Int       @id @default(autoincrement())
+  businessId           Int       @map("business_id")
+  claimReimbursementId Int       @map("claim_reimbursement_id")
+  userId               Int       @map("user_id")
+  createdAt            DateTime? @default(now()) @map("created_at")
+  updatedAt            DateTime? @updatedAt @map("updated_at")
+
+  business Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  claim    ClaimReimbursement @relation(fields: [claimReimbursementId], references: [id], onDelete: Cascade)
+  user     User               @relation("UserClaimReimbursements", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([claimReimbursementId, userId])
+  @@index([businessId])
+  @@index([userId])
+  @@map("user_claim_reimbursement")
 }
 
 // Day's Off — business/location holidays (legacy `essentials_holidays`).
@@ -600,9 +691,9 @@ model Payroll {
   createdAt      DateTime?     @default(now()) @map("created_at")
   updatedAt      DateTime?     @updatedAt @map("updated_at")
 
-  business Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  group    PayrollGroup? @relation(fields: [payrollGroupId], references: [id], onDelete: SetNull)
-  user     User          @relation("UserPayrolls", fields: [userId], references: [id], onDelete: Cascade)
+  business Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  group    PayrollGroup?    @relation(fields: [payrollGroupId], references: [id], onDelete: SetNull)
+  user     User             @relation("UserPayrolls", fields: [userId], references: [id], onDelete: Cascade)
   lines    PayrollLine[]
   payments PayrollPayment[]
 
@@ -736,10 +827,10 @@ model BusinessLocation {
   createdAt              DateTime?          @map("created_at")
   updatedAt              DateTime?          @updatedAt @map("updated_at")
 
-  business        Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  userLocations   UserLocation[]
-  primaryForUsers User[]         @relation("UserPrimaryLocation")
-  holidays        Holiday[]
+  business         Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userLocations    UserLocation[]
+  primaryForUsers  User[]                    @relation("UserPrimaryLocation")
+  holidays         Holiday[]
   productLocations ProductLocation[]
   productRacks     ProductRack[]
   transactions     Transaction[]
@@ -843,6 +934,7 @@ model User {
   locations           UserLocation[]
   leaveBalances       UserLeaveBalance[]                    @relation("UserLeaveBalances")
   leaves              Leave[]                               @relation("UserLeaves")
+  claims              UserClaimReimbursement[]              @relation("UserClaimReimbursements")
   allowanceDeductions EssentialsUserAllowanceAndDeduction[]
   userShifts          UserShift[]                           @relation("UserShifts")
   attendances         Attendance[]                          @relation("UserAttendances")
@@ -1373,6 +1465,7 @@ model TaxRate {
 
   transactions  Transaction[]
   purchaseLines PurchaseLine[]
+  sellLines     TransactionSellLine[]
 
   @@index([businessId])
   @@map("tax_rates")
@@ -1400,7 +1493,7 @@ model VariationTemplate {
   createdAt  DateTime? @default(now()) @map("created_at")
   updatedAt  DateTime? @updatedAt @map("updated_at")
 
-  business Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business Business                 @relation(fields: [businessId], references: [id], onDelete: Cascade)
   values   VariationValueTemplate[]
 
   @@index([businessId])
@@ -1494,13 +1587,14 @@ model Product {
   createdAt                DateTime? @default(now()) @map("created_at")
   updatedAt                DateTime? @updatedAt @map("updated_at")
 
-  business          Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business          Business                  @relation(fields: [businessId], references: [id], onDelete: Cascade)
   variations        Variation[]
   productVariations ProductVariation[]
   locations         ProductLocation[]
   racks             ProductRack[]
   stockLevels       VariationLocationDetail[]
   purchaseLines     PurchaseLine[]
+  sellLines         TransactionSellLine[]
 
   @@index([businessId])
   @@index([type])
@@ -1559,21 +1653,21 @@ model VariationLocationDetail {
 /// per-variation photo galleries — lives here. `filePath` is the storage key (identical whether the
 /// backend is local disk or S3), matching what StorageService returns.
 model Media {
-  id         Int    @id @default(autoincrement())
-  businessId Int    @map("business_id")
+  id             Int     @id @default(autoincrement())
+  businessId     Int     @map("business_id")
   /// Polymorphic target, e.g. modelType='Product', modelId=12.
-  modelType  String @map("model_type") @db.VarChar(191)
-  modelId    Int    @map("model_id")
+  modelType      String  @map("model_type") @db.VarChar(191)
+  modelId        Int     @map("model_id")
   /// What the file is FOR on that record — GOURI's `model_media_type`
   /// (e.g. 'product_brochure', 'variation_image'). One record can hold several kinds at once.
   modelMediaType String? @map("model_media_type") @db.VarChar(191)
 
-  filePath     String  @map("file_path") @db.VarChar(500)
-  fileName     String  @map("file_name") @db.VarChar(255)
-  mimeType     String? @map("mime_type") @db.VarChar(191)
-  fileSize     Int?    @map("file_size")
-  description  String? @db.Text
-  uploadedBy   Int?    @map("uploaded_by")
+  filePath    String  @map("file_path") @db.VarChar(500)
+  fileName    String  @map("file_name") @db.VarChar(255)
+  mimeType    String? @map("mime_type") @db.VarChar(191)
+  fileSize    Int?    @map("file_size")
+  description String? @db.Text
+  uploadedBy  Int?    @map("uploaded_by")
 
   createdAt DateTime? @default(now()) @map("created_at")
   updatedAt DateTime? @updatedAt @map("updated_at")
@@ -1680,11 +1774,12 @@ model Variation {
   createdAt            DateTime? @default(now()) @map("created_at")
   updatedAt            DateTime? @updatedAt @map("updated_at")
 
-  product          Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
-  productVariation ProductVariation      @relation(fields: [productVariationId], references: [id], onDelete: Cascade)
+  product          Product                   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productVariation ProductVariation          @relation(fields: [productVariationId], references: [id], onDelete: Cascade)
   groupPrices      VariationGroupPrice[]
   stockLevels      VariationLocationDetail[]
   purchaseLines    PurchaseLine[]
+  sellLines        TransactionSellLine[]
 
   @@index([productId])
   @@index([productVariationId])
@@ -1736,21 +1831,21 @@ model VariationGroupPrice {
 /// What business event a transaction row represents (GOURI `transactions.type`).
 /// The full set is declared up front so adding a module never needs an enum migration.
 enum TransactionType {
-  PURCHASE              @map("purchase")
-  PURCHASE_ORDER        @map("purchase_order")
-  PURCHASE_REQUISITION  @map("purchase_requisition")
-  PURCHASE_RETURN       @map("purchase_return")
-  PURCHASE_TRANSFER @map("purchase_transfer")
-  OPENING_STOCK     @map("opening_stock")
-  SELL              @map("sell")
-  SELL_RETURN       @map("sell_return")
-  SELL_TRANSFER     @map("sell_transfer")
-  SALES_ORDER       @map("sales_order")
-  OPENING_BALANCE   @map("opening_balance")
-  EXPENSE           @map("expense")
-  EXPENSE_REFUND    @map("expense_refund")
-  STOCK_ADJUSTMENT  @map("stock_adjustment")
-  PAYROLL           @map("payroll")
+  PURCHASE             @map("purchase")
+  PURCHASE_ORDER       @map("purchase_order")
+  PURCHASE_REQUISITION @map("purchase_requisition")
+  PURCHASE_RETURN      @map("purchase_return")
+  PURCHASE_TRANSFER    @map("purchase_transfer")
+  OPENING_STOCK        @map("opening_stock")
+  SELL                 @map("sell")
+  SELL_RETURN          @map("sell_return")
+  SELL_TRANSFER        @map("sell_transfer")
+  SALES_ORDER          @map("sales_order")
+  OPENING_BALANCE      @map("opening_balance")
+  EXPENSE              @map("expense")
+  EXPENSE_REFUND       @map("expense_refund")
+  STOCK_ADJUSTMENT     @map("stock_adjustment")
+  PAYROLL              @map("payroll")
 }
 
 /// Document lifecycle. GOURI uses ONE column for two disjoint domains: a purchase may only be
@@ -1765,16 +1860,24 @@ enum ShippingStatus {
   CANCELLED @map("cancelled")
 }
 
+/// A draft sell's flavour. GOURI keeps `sub_status` as a free string alongside `status='draft'`.
+enum SellSubStatus {
+  QUOTATION @map("quotation")
+  PROFORMA  @map("proforma")
+}
+
 enum TransactionStatus {
-  RECEIVED @map("received")
-  PENDING  @map("pending")
-  ORDERED  @map("ordered")
-  DRAFT    @map("draft")
-  FINAL    @map("final")
+  RECEIVED   @map("received")
+  PENDING    @map("pending")
+  ORDERED    @map("ordered")
+  DRAFT      @map("draft")
+  FINAL      @map("final")
   /// Requisitions and purchase orders only: some of the ordered quantity has been drawn down.
-  PARTIAL   @map("partial")
+  PARTIAL    @map("partial")
   /// Requisitions and purchase orders only: every ordered unit has been drawn down.
-  COMPLETED @map("completed")
+  COMPLETED  @map("completed")
+  /// Stock transfers only: dispatched from the source, not yet received at the destination.
+  IN_TRANSIT @map("in_transit")
 }
 
 enum DiscountType {
@@ -1783,12 +1886,49 @@ enum DiscountType {
 }
 
 /// One business document. See the header note for why this is a single table.
+/// Expense category master (legacy `expense_categories`). Self-referential: a `parentId` makes a
+/// row a sub-category. Referenced by expense transactions via `expense_category_id` /
+/// `expense_sub_category_id`.
+model ExpenseCategory {
+  id         Int       @id @default(autoincrement())
+  name       String    @db.VarChar(191)
+  businessId Int       @map("business_id")
+  code       String?   @db.VarChar(191)
+  parentId   Int?      @map("parent_id")
+  deletedAt  DateTime? @map("deleted_at")
+  createdAt  DateTime? @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  business Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  parent   ExpenseCategory?  @relation("ExpenseCategoryTree", fields: [parentId], references: [id])
+  children ExpenseCategory[] @relation("ExpenseCategoryTree")
+
+  expenseTransactions    Transaction[] @relation("ExpenseCategory")
+  expenseSubTransactions Transaction[] @relation("ExpenseSubCategory")
+
+  @@index([businessId])
+  @@index([parentId])
+  @@map("expense_categories")
+}
+
 model Transaction {
-  id         Int             @id @default(autoincrement())
-  businessId Int             @map("business_id")
-  locationId Int             @map("location_id")
+  id         Int               @id @default(autoincrement())
+  businessId Int               @map("business_id")
+  locationId Int               @map("location_id")
   type       TransactionType
   status     TransactionStatus
+
+  // ── expense-specific (type = expense / expense_refund) ──
+  expenseCategoryId    Int?               @map("expense_category_id")
+  expenseSubCategoryId Int?               @map("expense_sub_category_id")
+  /// The user this expense is "for" (legacy `expense_for`). Scalar like `createdBy` — no User relation.
+  expenseFor           Int?               @map("expense_for")
+  isRecurring          Boolean            @default(false) @map("is_recurring")
+  recurInterval        Decimal?           @map("recur_interval") @db.Decimal(22, 4)
+  recurIntervalType    RecurIntervalType? @map("recur_interval_type")
+  recurRepetitions     Int?               @map("recur_repetitions")
+  recurStoppedOn       DateTime?          @map("recur_stopped_on")
+  recurParentId        Int?               @map("recur_parent_id")
 
   /// Supplier for a purchase, customer for a sell. Optional because expenses have neither.
   contactId Int? @map("contact_id")
@@ -1809,11 +1949,11 @@ model Transaction {
   /// A flat amount when `discountType` is FIXED, a percentage NUMBER when PERCENTAGE.
   discountAmount Decimal       @default(0) @map("discount_amount") @db.Decimal(22, 4)
 
-  shippingDetails String?  @map("shipping_details") @db.VarChar(191)
-  shippingCharges Decimal  @default(0) @map("shipping_charges") @db.Decimal(22, 4)
+  shippingDetails    String? @map("shipping_details") @db.VarChar(191)
+  shippingCharges    Decimal @default(0) @map("shipping_charges") @db.Decimal(22, 4)
   /// Landed costs beyond shipping (freight, duty…). GOURI hard-caps these at four numbered column
   /// pairs; JSON keeps it open without 8 more columns: `[{ name, amount }]`.
-  additionalExpenses Json? @map("additional_expenses")
+  additionalExpenses Json?   @map("additional_expenses")
 
   /// The grand total, in BASE currency. Always recomputed server-side — GOURI trusts the client's.
   finalTotal    Decimal       @default(0) @map("final_total") @db.Decimal(22, 4)
@@ -1837,13 +1977,22 @@ model Transaction {
 
   // ── links between documents ──────────────────────────
   /// A return points at the document it reverses.
-  returnParentId Int? @map("return_parent_id")
+  returnParentId         Int?  @map("return_parent_id")
   /// The incoming leg of a stock transfer points at the outgoing one.
-  transferParentId Int? @map("transfer_parent_id")
+  transferParentId       Int?  @map("transfer_parent_id")
   /// Purchase orders this purchase draws down: `[1, 7]`. GOURI stores the same array as JSON text.
-  purchaseOrderIds Json? @map("purchase_order_ids")
+  purchaseOrderIds       Json? @map("purchase_order_ids")
   /// Requisitions this purchase order draws down.
   purchaseRequisitionIds Json? @map("purchase_requisition_ids")
+  /// Sales orders this sell draws down.
+  salesOrderIds          Json? @map("sales_order_ids")
+
+  // ── sell-specific ────────────────────────────────────
+  /// A draft sell that is a quotation or proforma, vs a plain draft. Null for everything else.
+  /// GOURI merges this with `status` to present final/draft/quotation/proforma in one dropdown.
+  subStatus      SellSubStatus? @map("sub_status")
+  /// Rounding applied to the sell's grand total (can be negative). GOURI stores it, adds it in JS.
+  roundOffAmount Decimal        @default(0) @map("round_off_amount") @db.Decimal(22, 4)
 
   // ── ordering / shipping (purchase orders and requisitions) ──
   /// A requisition's "required by" date; a purchase order's expected delivery date.
@@ -1856,6 +2005,15 @@ model Transaction {
   staffNote       String? @map("staff_note") @db.Text
   document        String? @db.VarChar(500)
 
+  // ── stock adjustments ──
+  /// GOURI stores a `wastage_types.id` in its `adjustment_type` column — modelled here as an FK.
+  adjustmentTypeId     Int?     @map("adjustment_type")
+  totalAmountRecovered Decimal? @map("total_amount_recovered") @db.Decimal(22, 4)
+  // ── stock transfers ──
+  /// The source-lot allocations a completed transfer consumed, so a delete can give them back:
+  /// `[{ purchaseLineId, quantity }]`.
+  lotStockMap          Json?    @map("lot_stock_map")
+
   customField1 String? @map("custom_field_1") @db.VarChar(191)
   customField2 String? @map("custom_field_2") @db.VarChar(191)
   customField3 String? @map("custom_field_3") @db.VarChar(191)
@@ -1865,15 +2023,21 @@ model Transaction {
   createdAt DateTime? @default(now()) @map("created_at")
   updatedAt DateTime? @updatedAt @map("updated_at")
 
-  business      Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  location      BusinessLocation     @relation(fields: [locationId], references: [id])
-  contact       Contact?             @relation(fields: [contactId], references: [id])
-  taxRate       TaxRate?             @relation(fields: [taxRateId], references: [id])
-  purchaseLines PurchaseLine[]
-  payments      TransactionPayment[]
+  business             Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  location             BusinessLocation      @relation(fields: [locationId], references: [id])
+  contact              Contact?              @relation(fields: [contactId], references: [id])
+  taxRate              TaxRate?              @relation(fields: [taxRateId], references: [id])
+  expenseCategory      ExpenseCategory?      @relation("ExpenseCategory", fields: [expenseCategoryId], references: [id])
+  expenseSubCategory   ExpenseCategory?      @relation("ExpenseSubCategory", fields: [expenseSubCategoryId], references: [id])
+  purchaseLines        PurchaseLine[]
+  sellLines            TransactionSellLine[]
+  payments             TransactionPayment[]
+  accountTransactions  AccountTransaction[]
+  adjustmentType       WastageType?          @relation(fields: [adjustmentTypeId], references: [id])
+  stockAdjustmentLines StockAdjustmentLine[]
   /// A return and the document it reverses.
-  returnParent  Transaction?         @relation("TransactionReturn", fields: [returnParentId], references: [id])
-  returns       Transaction[]        @relation("TransactionReturn")
+  returnParent         Transaction?          @relation("TransactionReturn", fields: [returnParentId], references: [id])
+  returns              Transaction[]         @relation("TransactionReturn")
 
   // Every list is "this tenant's documents of this type, newest first".
   @@unique([businessId, refNo])
@@ -1882,6 +2046,10 @@ model Transaction {
   @@index([contactId])
   @@index([locationId])
   @@index([returnParentId])
+  @@index([expenseCategoryId])
+  @@index([expenseSubCategoryId])
+  @@index([expenseFor])
+  @@index([recurParentId])
   @@map("transactions")
 }
 
@@ -1896,9 +2064,9 @@ model PurchaseLine {
   variationId   Int @map("variation_id")
 
   /// Received quantity, always in the product's BASE unit (sub-unit input is multiplied out).
-  quantity Decimal @default(0) @db.Decimal(22, 4)
+  quantity              Decimal @default(0) @db.Decimal(22, 4)
   /// The unit the user actually typed in, when it wasn't the base unit.
-  subUnitId Int? @map("sub_unit_id")
+  subUnitId             Int?    @map("sub_unit_id")
   secondaryUnitQuantity Decimal @default(0) @map("secondary_unit_quantity") @db.Decimal(22, 4)
 
   // ── how much of this lot is gone ─────────────────────
@@ -1909,15 +2077,15 @@ model PurchaseLine {
 
   // ── unit prices, all in BASE currency, per BASE unit ──
   /// List price before the line discount.
-  ppWithoutDiscount Decimal @default(0) @map("pp_without_discount") @db.Decimal(22, 4)
+  ppWithoutDiscount   Decimal @default(0) @map("pp_without_discount") @db.Decimal(22, 4)
   /// Widened from GOURI's decimal(5,2) — the only money-ish column it left at 2dp.
-  discountPercent   Decimal @default(0) @map("discount_percent") @db.Decimal(22, 4)
+  discountPercent     Decimal @default(0) @map("discount_percent") @db.Decimal(22, 4)
   /// After the line discount, before tax.
-  purchasePrice     Decimal @default(0) @map("purchase_price") @db.Decimal(22, 4)
+  purchasePrice       Decimal @default(0) @map("purchase_price") @db.Decimal(22, 4)
   /// Tax for ONE unit, not for the line (GOURI's meaning — easy to misread).
-  itemTax           Decimal @default(0) @map("item_tax") @db.Decimal(22, 4)
+  itemTax             Decimal @default(0) @map("item_tax") @db.Decimal(22, 4)
   purchasePriceIncTax Decimal @default(0) @map("purchase_price_inc_tax") @db.Decimal(22, 4)
-  taxRateId         Int?    @map("tax_id")
+  taxRateId           Int?    @map("tax_id")
 
   lotNumber String?   @map("lot_number") @db.VarChar(191)
   mfgDate   DateTime? @map("mfg_date") @db.Date
@@ -1925,23 +2093,24 @@ model PurchaseLine {
 
   // ── where this line came from, and what has been drawn off it ──
   /// A purchase line points at the purchase-order line it receives against.
-  purchaseOrderLineId Int? @map("purchase_order_line_id")
+  purchaseOrderLineId       Int?    @map("purchase_order_line_id")
   /// A purchase-order line points at the requisition line it fulfils.
-  purchaseRequisitionLineId Int? @map("purchase_requisition_line_id")
+  purchaseRequisitionLineId Int?    @map("purchase_requisition_line_id")
   /// How much of THIS line (a requisition or purchase-order line) has been drawn down by the
   /// document below it. Only ever changed through an atomic increment — GOURI reads, adds in PHP
   /// and saves, so two concurrent receipts lose one of the updates.
-  poQuantityPurchased Decimal @default(0) @map("po_quantity_purchased") @db.Decimal(22, 4)
+  poQuantityPurchased       Decimal @default(0) @map("po_quantity_purchased") @db.Decimal(22, 4)
   /// A return line points at the purchase line it sends back.
-  parentLineId Int? @map("parent_line_id")
+  parentLineId              Int?    @map("parent_line_id")
 
   createdAt DateTime? @default(now()) @map("created_at")
   updatedAt DateTime? @updatedAt @map("updated_at")
 
-  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
-  product     Product     @relation(fields: [productId], references: [id])
-  variation   Variation   @relation(fields: [variationId], references: [id])
-  taxRate     TaxRate?    @relation(fields: [taxRateId], references: [id])
+  transaction Transaction              @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  product     Product                  @relation(fields: [productId], references: [id])
+  variation   Variation                @relation(fields: [variationId], references: [id])
+  taxRate     TaxRate?                 @relation(fields: [taxRateId], references: [id])
+  allocations SellPurchaseAllocation[]
 
   @@index([transactionId])
   @@index([variationId])
@@ -1955,32 +2124,112 @@ model PurchaseLine {
   @@map("purchase_lines")
 }
 
+/// One sold line of a sell (GOURI `transaction_sell_lines`).
+///
+/// The stock it consumes is allocated to purchase LOTS through `SellPurchaseAllocation` (FIFO/LIFO
+/// per the business setting), which is what lets the cost of goods sold be known and a return free
+/// the exact lots it came from.
+model TransactionSellLine {
+  id            Int @id @default(autoincrement())
+  transactionId Int @map("transaction_id")
+  productId     Int @map("product_id")
+  variationId   Int @map("variation_id")
+
+  /// Sold quantity, in the product's BASE unit (sub-unit input is multiplied out).
+  quantity              Decimal @default(0) @db.Decimal(22, 4)
+  subUnitId             Int?    @map("sub_unit_id")
+  secondaryUnitQuantity Decimal @default(0) @map("secondary_unit_quantity") @db.Decimal(22, 4)
+  /// How much of this line has been sent back by a sell return (cumulative).
+  quantityReturned      Decimal @default(0) @map("quantity_returned") @db.Decimal(22, 4)
+
+  // ── unit prices, all EX/INC tax, per BASE unit ────────
+  /// List price before the line discount, excluding tax.
+  unitPriceBeforeDiscount Decimal       @default(0) @map("unit_price_before_discount") @db.Decimal(22, 4)
+  /// After the line discount, excluding tax.
+  unitPrice               Decimal       @default(0) @map("unit_price") @db.Decimal(22, 4)
+  lineDiscountType        DiscountType? @map("line_discount_type")
+  lineDiscountAmount      Decimal       @default(0) @map("line_discount_amount") @db.Decimal(22, 4)
+  /// Tax for ONE unit (GOURI's `item_tax` meaning).
+  itemTax                 Decimal       @default(0) @map("item_tax") @db.Decimal(22, 4)
+  /// After the line discount, including tax — the figure document totals sum.
+  unitPriceIncTax         Decimal       @default(0) @map("unit_price_inc_tax") @db.Decimal(22, 4)
+  taxRateId               Int?          @map("tax_id")
+
+  note String? @map("sell_line_note") @db.Text
+
+  // ── sales-order draw-down ─────────────────────────────
+  /// When this sell line invoices a sales-order line, points at it.
+  soLineId           Int?    @map("so_line_id")
+  /// On a SALES-ORDER line: how much has been drawn into sells. Atomic increment only.
+  soQuantityInvoiced Decimal @default(0) @map("so_quantity_invoiced") @db.Decimal(22, 4)
+
+  /// A sell-return line points at the sell line it reverses.
+  parentSellLineId Int? @map("parent_sell_line_id")
+
+  createdAt DateTime? @default(now()) @map("created_at")
+  updatedAt DateTime? @updatedAt @map("updated_at")
+
+  transaction Transaction              @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  product     Product                  @relation(fields: [productId], references: [id])
+  variation   Variation                @relation(fields: [variationId], references: [id])
+  taxRate     TaxRate?                 @relation(fields: [taxRateId], references: [id])
+  allocations SellPurchaseAllocation[]
+
+  @@index([transactionId])
+  @@index([variationId])
+  @@index([productId])
+  @@index([soLineId])
+  @@index([parentSellLineId])
+  @@map("transaction_sell_lines")
+}
+
+/// The FIFO map: which purchase LOT each sold unit came from (GOURI
+/// `transaction_sell_lines_purchase_lines`). One sell line spreads across as many lots as it needs.
+model SellPurchaseAllocation {
+  id             Int @id @default(autoincrement())
+  sellLineId     Int @map("sell_line_id")
+  purchaseLineId Int @map("purchase_line_id")
+
+  quantity    Decimal @default(0) @db.Decimal(22, 4)
+  /// How much of THIS allocation a sell return has since freed back to the lot.
+  qtyReturned Decimal @default(0) @map("qty_returned") @db.Decimal(22, 4)
+
+  createdAt DateTime? @default(now()) @map("created_at")
+
+  sellLine     TransactionSellLine @relation(fields: [sellLineId], references: [id], onDelete: Cascade)
+  purchaseLine PurchaseLine        @relation(fields: [purchaseLineId], references: [id], onDelete: Cascade)
+
+  @@index([sellLineId])
+  @@index([purchaseLineId])
+  @@map("transaction_sell_lines_purchase_lines")
+}
+
 /// Money received or paid against a document (GOURI `transaction_payments`).
 model TransactionPayment {
-  id         Int  @id @default(autoincrement())
-  businessId Int  @map("business_id")
+  id            Int  @id @default(autoincrement())
+  businessId    Int  @map("business_id")
   /// Null for a contact-level advance that is not yet allocated to any document.
   transactionId Int? @map("transaction_id")
 
-  amount Decimal @default(0) @db.Decimal(22, 4)
+  amount    Decimal @default(0) @db.Decimal(22, 4)
   /// cash | card | cheque | bank_transfer | advance | other | custom_pay_1..7 — validated in code,
   /// as in GOURI, so a business can rename its custom methods without a migration.
-  method String  @db.VarChar(191)
+  method    String  @db.VarChar(191)
   /// The Payment Account this moved through. FK arrives with the Payment Accounts module.
-  accountId Int? @map("account_id")
+  accountId Int?    @map("account_id")
 
   /// Human reference, e.g. `PP2026/0012`.
   paymentRefNo String   @map("payment_ref_no") @db.VarChar(191)
   paidOn       DateTime @map("paid_on")
 
   /// True when the money moved the other way (change given, refund).
-  isReturn  Boolean @default(false) @map("is_return")
+  isReturn   Boolean @default(false) @map("is_return")
   /// Credited to the contact's advance balance rather than a document.
-  isAdvance Boolean @default(false) @map("is_advance")
+  isAdvance  Boolean @default(false) @map("is_advance")
   /// The contact this payment belongs to — set even when transactionId is null.
-  paymentFor Int? @map("payment_for")
+  paymentFor Int?    @map("payment_for")
   /// A lump payment allocated across several documents: children point at the parent.
-  parentId Int? @map("parent_id")
+  parentId   Int?    @map("parent_id")
 
   // Card PAN / expiry / CVV are deliberately NOT stored — see the header note.
   cardTransactionNumber String? @map("card_transaction_number") @db.VarChar(191)
@@ -1997,10 +2246,12 @@ model TransactionPayment {
   createdAt DateTime? @default(now()) @map("created_at")
   updatedAt DateTime? @updatedAt @map("updated_at")
 
-  business    Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  transaction Transaction?         @relation(fields: [transactionId], references: [id], onDelete: Cascade)
-  parent      TransactionPayment?  @relation("PaymentAllocation", fields: [parentId], references: [id])
-  children    TransactionPayment[] @relation("PaymentAllocation")
+  business            Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  transaction         Transaction?         @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  parent              TransactionPayment?  @relation("PaymentAllocation", fields: [parentId], references: [id])
+  children            TransactionPayment[] @relation("PaymentAllocation")
+  account             Account?             @relation(fields: [accountId], references: [id])
+  accountTransactions AccountTransaction[]
 
   @@unique([businessId, paymentRefNo])
   @@index([transactionId])
@@ -2009,4 +2260,142 @@ model TransactionPayment {
   @@index([accountId])
   @@index([parentId])
   @@map("transaction_payments")
+}
+
+// ===================== PAYMENT ACCOUNTS ====================================
+// GOURI `accounts` / `account_transactions` / `account_types`. Balance of an account =
+// SUM(IF(type='credit', amount, -amount)) over its non-deleted account_transactions.
+
+enum AccountTransactionType {
+  DEBIT  @map("debit")
+  CREDIT @map("credit")
+}
+
+/// Only MANUAL rows carry a sub_type; rows auto-posted from a payment leave it NULL.
+enum AccountSubType {
+  OPENING_BALANCE @map("opening_balance")
+  FUND_TRANSFER   @map("fund_transfer")
+  DEPOSIT         @map("deposit")
+}
+
+/// A two-level grouping (parent → sub) for accounts. Hard-deleted in GOURI (no soft-delete).
+model AccountType {
+  id                  Int       @id @default(autoincrement())
+  businessId          Int       @map("business_id")
+  name                String    @db.VarChar(191)
+  parentAccountTypeId Int?      @map("parent_account_type_id")
+  createdAt           DateTime? @default(now()) @map("created_at")
+  updatedAt           DateTime? @updatedAt @map("updated_at")
+
+  business Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  parent   AccountType?  @relation("AccountTypeParent", fields: [parentAccountTypeId], references: [id])
+  children AccountType[] @relation("AccountTypeParent")
+  accounts Account[]
+
+  @@index([businessId])
+  @@index([parentAccountTypeId])
+  @@map("account_types")
+}
+
+/// A payment account (bank / cash / capital…). Soft-deleted.
+model Account {
+  id             Int       @id @default(autoincrement())
+  businessId     Int       @map("business_id")
+  name           String    @db.VarChar(191)
+  accountNumber  String    @map("account_number") @db.VarChar(191)
+  accountTypeId  Int?      @map("account_type_id")
+  /// GOURI `account_details` (text cast array): up to 6 { label, value } rows.
+  accountDetails Json?     @map("account_details")
+  note           String?   @db.Text
+  isClosed       Boolean   @default(false) @map("is_closed")
+  createdBy      Int       @map("created_by")
+  deletedAt      DateTime? @map("deleted_at")
+  createdAt      DateTime? @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  business     Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  accountType  AccountType?         @relation(fields: [accountTypeId], references: [id])
+  transactions AccountTransaction[]
+  payments     TransactionPayment[]
+
+  @@index([businessId])
+  @@index([accountTypeId])
+  @@map("accounts")
+}
+
+/// One movement on an account. Manual rows (opening_balance/fund_transfer/deposit) OR an auto row
+/// posted when a payment is recorded (sub_type NULL, linked via transaction_payment_id).
+model AccountTransaction {
+  id                    Int                    @id @default(autoincrement())
+  accountId             Int                    @map("account_id")
+  type                  AccountTransactionType
+  subType               AccountSubType?        @map("sub_type")
+  amount                Decimal                @default(0) @db.Decimal(22, 4)
+  reffNo                String?                @map("reff_no") @db.VarChar(191)
+  operationDate         DateTime               @map("operation_date")
+  createdBy             Int                    @map("created_by")
+  transactionId         Int?                   @map("transaction_id")
+  transactionPaymentId  Int?                   @map("transaction_payment_id")
+  /// The paired row for a fund-transfer / two-legged deposit.
+  transferTransactionId Int?                   @map("transfer_transaction_id")
+  note                  String?                @db.Text
+  deletedAt             DateTime?              @map("deleted_at")
+  createdAt             DateTime?              @default(now()) @map("created_at")
+  updatedAt             DateTime?              @updatedAt @map("updated_at")
+
+  account            Account              @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  transaction        Transaction?         @relation(fields: [transactionId], references: [id])
+  transactionPayment TransactionPayment?  @relation(fields: [transactionPaymentId], references: [id])
+  transfer           AccountTransaction?  @relation("AccountTransfer", fields: [transferTransactionId], references: [id])
+  transferOf         AccountTransaction[] @relation("AccountTransfer")
+
+  @@index([accountId])
+  @@index([operationDate])
+  @@index([transactionId])
+  @@index([transactionPaymentId])
+  @@index([transferTransactionId])
+  @@map("account_transactions")
+}
+
+// ===================== WASTAGE / STOCK ADJUSTMENTS =========================
+
+/// GOURI `wastage_types` — the master a stock adjustment's `adjustment_type` points at.
+model WastageType {
+  id         Int       @id @default(autoincrement())
+  businessId Int       @map("business_id")
+  name       String    @db.VarChar(191)
+  /// Carried in GOURI's table but never surfaced in its UI — kept for import fidelity.
+  amount     Decimal?  @db.Decimal(22, 4)
+  createdBy  Int?      @map("created_by")
+  deletedAt  DateTime? @map("deleted_at")
+  createdAt  DateTime? @default(now()) @map("created_at")
+  updatedAt  DateTime? @updatedAt @map("updated_at")
+
+  business    Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  adjustments Transaction[]
+
+  @@index([businessId])
+  @@map("wastage_types")
+}
+
+/// One line of a stock-adjustment transaction (GOURI `stock_adjustment_lines`).
+model StockAdjustmentLine {
+  id             Int       @id @default(autoincrement())
+  transactionId  Int       @map("transaction_id")
+  productId      Int       @map("product_id")
+  variationId    Int       @map("variation_id")
+  quantity       Decimal   @default(0) @db.Decimal(22, 4)
+  unitPrice      Decimal   @default(0) @map("unit_price") @db.Decimal(22, 4)
+  /// When set, consumption is restricted to this specific purchase lot.
+  lotNoLineId    Int?      @map("lot_no_line_id")
+  /// The purchase lots this line consumed: `[{ purchaseLineId, quantity }]` — for exact reversal.
+  lotAllocations Json?     @map("lot_allocations")
+  createdAt      DateTime? @default(now()) @map("created_at")
+  updatedAt      DateTime? @updatedAt @map("updated_at")
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId])
+  @@index([variationId])
+  @@map("stock_adjustment_lines")
 }

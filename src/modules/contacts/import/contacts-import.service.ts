@@ -147,6 +147,8 @@ export class ContactsImportService {
     const warnings: ImportIssue[] = [];
     const contactRows: ContactCreateRow[] = [];
     const needsGeneratedId: number[] = [];
+    // Opening balance per contact row (0 = none), applied after the contacts are inserted.
+    const openingBalances: number[] = [];
 
     const header = (key: string) => IMPORT_COLUMNS.find((c) => c.key === key)!.header;
     const err = (row: number, key: string, message: string) => errors.push({ row, column: header(key), message });
@@ -236,14 +238,13 @@ export class ContactsImportService {
         else dob = d;
       }
 
-      // 9 — parsed and validated, but deliberately NOT imported: GOURI writes it to `transactions`
-      // (type=opening_balance), a table this port does not have yet.
+      // 9 — opening balance. GOURI writes it to `transactions` (type=opening_balance); so do we,
+      // in a batch after the contacts are inserted.
+      let openingBalance = 0;
       if (values.opening_balance) {
         const n = Number(values.opening_balance);
         if (Number.isNaN(n)) err(rowNo, 'opening_balance', `"${values.opening_balance}" is not a valid amount`);
-        else if (n !== 0) {
-          warn(rowNo, 'opening_balance', 'Not imported yet — opening balances arrive with the transactions module');
-        }
+        else if (n > 0) openingBalance = n;
       }
 
       if (errors.length > before) continue; // row is bad; keep checking the rest (GOURI stops at the first)
@@ -288,9 +289,10 @@ export class ContactsImportService {
         contactStatus: 'active',
         createdAt: new Date(),
       });
+      openingBalances.push(openingBalance);
     }
 
-    return { errors, warnings, contactRows, needsGeneratedId };
+    return { errors, warnings, contactRows, needsGeneratedId, openingBalances };
   }
 
   // ── import ─────────────────────────────────────────────
@@ -317,7 +319,7 @@ export class ContactsImportService {
     const rows = await this.readRows(file);
     if (rows.length === 0) throw new BadRequestException('That file has no data rows — only the header');
 
-    const { errors, warnings, contactRows, needsGeneratedId } = await this.validate(businessId, userId, rows);
+    const { errors, warnings, contactRows, needsGeneratedId, openingBalances } = await this.validate(businessId, userId, rows);
 
     const report: ImportReport = {
       totalRows: rows.length,
@@ -361,6 +363,9 @@ export class ContactsImportService {
     const { count } = await this.prisma.contact.createMany({ data: contactRows as never });
     report.imported = count;
 
+    // Opening balances → one `opening_balance` transaction each (GOURI's per-row behaviour, batched).
+    await this.importOpeningBalances(businessId, userId, contactRows, openingBalances);
+
     this.audit.log({
       action: 'imported',
       subjectType: 'Contact',
@@ -370,12 +375,68 @@ export class ContactsImportService {
     return report;
   }
 
-  /** Bump the counter by `n` and return the FIRST reserved value. */
-  private async reserveContactIds(businessId: number, n: number): Promise<number> {
+  /**
+   * Create one `opening_balance` transaction per imported contact that has one. `createMany` gives
+   * no ids back, so we map the just-inserted contacts by their (unique) contact_id, reserve the
+   * reference-number range in one bump, and insert all the transactions in a single statement.
+   */
+  private async importOpeningBalances(
+    businessId: number,
+    userId: number,
+    contactRows: ContactCreateRow[],
+    openingBalances: number[],
+  ): Promise<void> {
+    const withOb = contactRows
+      .map((row, i) => ({ contactId: row.contactId as string, amount: openingBalances[i] ?? 0 }))
+      .filter((r) => r.amount > 0 && r.contactId);
+    if (withOb.length === 0) return;
+
+    const [location, created] = await Promise.all([
+      this.prisma.businessLocation.findFirst({ where: { businessId, deletedAt: null }, orderBy: { id: 'asc' }, select: { id: true } }),
+      this.prisma.contact.findMany({
+        where: { businessId, contactId: { in: withOb.map((r) => r.contactId) } },
+        select: { id: true, contactId: true },
+      }),
+    ]);
+    if (!location) return; // no location to hang opening balances on
+    const idOf = new Map(created.map((c) => [c.contactId, c.id]));
+
+    const start = await this.reserveRefCount(businessId, 'opening_balance', withOb.length);
+    const year = new Date().getFullYear();
+    await this.prisma.transaction.createMany({
+      data: withOb
+        .map((r, i) => {
+          const id = idOf.get(r.contactId);
+          if (!id) return null;
+          return {
+            businessId,
+            locationId: location.id,
+            contactId: id,
+            type: 'OPENING_BALANCE' as const,
+            status: 'FINAL' as const,
+            paymentStatus: 'DUE' as const,
+            refNo: `OB${year}/${String(start + i).padStart(4, '0')}`,
+            transactionDate: new Date(),
+            lineSubtotal: r.amount,
+            finalTotal: r.amount,
+            createdBy: userId,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null),
+    });
+  }
+
+  /** Bump the contact counter by `n` and return the FIRST reserved value. */
+  private reserveContactIds(businessId: number, n: number): Promise<number> {
+    return this.reserveRefCount(businessId, 'contacts', n);
+  }
+
+  /** Bump any reference counter by `n` in one write and return the FIRST reserved value. */
+  private async reserveRefCount(businessId: number, refType: string, n: number): Promise<number> {
     return this.prisma.$transaction(async (tx) => {
-      const existing = await tx.referenceCount.findFirst({ where: { businessId, refType: 'contacts' } });
+      const existing = await tx.referenceCount.findFirst({ where: { businessId, refType } });
       if (!existing) {
-        await tx.referenceCount.create({ data: { businessId, refType: 'contacts', refCount: n } });
+        await tx.referenceCount.create({ data: { businessId, refType, refCount: n } });
         return 1;
       }
       const updated = await tx.referenceCount.update({

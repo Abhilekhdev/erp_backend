@@ -4,6 +4,7 @@ import { AuditService } from '../../common/audit/audit.service';
 import { AbilityService } from '../../common/services/ability.service';
 import { ReferenceNumberService } from '../../common/services/reference-number.service';
 import { StockService, type StockMovement } from '../../common/services/stock.service';
+import { AccountPostingService } from '../accounts/account-posting.service';
 import { PrismaService } from '../../infra/prisma/prisma.service';
 import type { AccessPayload } from '../auth/token.service';
 import { paymentStatusFor, round4 } from '../purchases/purchase.calc';
@@ -41,6 +42,7 @@ export class PurchaseReturnsService {
     private readonly refs: ReferenceNumberService,
     private readonly audit: AuditService,
     private readonly ability: AbilityService,
+    private readonly accountPosting: AccountPostingService,
   ) {}
 
   /** A return only reverses stock that was actually posted. */
@@ -401,16 +403,19 @@ export class PurchaseReturnsService {
 
     const refNo = await this.refs.generate(businessId, 'purchase_payment', 'PP');
     await this.prisma.$transaction(async (tx) => {
-      await tx.transactionPayment.create({
+      const accountId = dto.account_id ?? null;
+      const amount = round4(Number(dto.amount));
+      const paidOn = dto.paid_on ? new Date(dto.paid_on) : new Date();
+      const payment = await tx.transactionPayment.create({
         data: {
           businessId,
           transactionId: id,
           paymentFor: ret.contactId,
-          amount: round4(Number(dto.amount)),
+          amount,
           method: dto.method,
-          accountId: dto.account_id ?? null,
+          accountId,
           paymentRefNo: refNo,
-          paidOn: dto.paid_on ? new Date(dto.paid_on) : new Date(),
+          paidOn,
           cardTransactionNumber: dto.card_transaction_number ?? null,
           cardHolderName: dto.card_holder_name ?? null,
           cardType: dto.card_type ?? null,
@@ -420,6 +425,16 @@ export class PurchaseReturnsService {
           note: dto.note ?? null,
           createdBy: user.sub,
         },
+      });
+      // A supplier refund on a purchase return is money back INTO the account (credit).
+      await this.accountPosting.postForPayment(tx, {
+        paymentId: payment.id,
+        accountId,
+        transactionId: id,
+        transactionType: 'purchase_return',
+        amount,
+        paidOn,
+        createdBy: user.sub,
       });
       await tx.transaction.update({
         where: { id },
@@ -450,6 +465,7 @@ export class PurchaseReturnsService {
     if (!ret) throw new NotFoundException('Refund not found');
 
     await this.prisma.$transaction(async (tx) => {
+      await this.accountPosting.reverseForPayment(tx, paymentId);
       await tx.transactionPayment.delete({ where: { id: paymentId } });
       const rest = await tx.transactionPayment.aggregate({
         where: { transactionId: ret.id },

@@ -10,6 +10,7 @@ import { CommonModule } from './common/common.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { PrismaModule } from './infra/prisma/prisma.module';
+import { AccountsModule } from './modules/accounts/accounts.module';
 import { ActivityLogModule } from './modules/activity-log/activity-log.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { BusinessLocationsModule } from './modules/business-locations/business-locations.module';
@@ -21,6 +22,8 @@ import { CategoriesModule } from './modules/categories/categories.module';
 import { CommissionAgentsModule } from './modules/commission-agents/commission-agents.module';
 import { ContactsModule } from './modules/contacts/contacts.module';
 import { CustomerGroupsModule } from './modules/customer-groups/customer-groups.module';
+import { ExpenseCategoriesModule } from './modules/expense-categories/expense-categories.module';
+import { ExpensesModule } from './modules/expenses/expenses.module';
 import { HealthModule } from './modules/health/health.module';
 import { HrmModule } from './modules/hrm/hrm.module';
 import { InvoiceSchemesModule } from './modules/invoice-schemes/invoice-schemes.module';
@@ -28,12 +31,20 @@ import { NotificationTemplatesModule } from './modules/notification-templates/no
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { PermissionsModule } from './modules/permissions/permissions.module';
 import { ProductsModule } from './modules/products/products.module';
+import { OpeningStockModule } from './modules/opening-stock/opening-stock.module';
+import { SellsModule } from './modules/sells/sells.module';
+import { SalesOrdersModule } from './modules/sales-orders/sales-orders.module';
+import { SellReturnsModule } from './modules/sell-returns/sell-returns.module';
 import { PurchaseOrdersModule } from './modules/purchase-orders/purchase-orders.module';
 import { PurchaseRequisitionsModule } from './modules/purchase-requisitions/purchase-requisitions.module';
 import { PurchaseReturnsModule } from './modules/purchase-returns/purchase-returns.module';
 import { PurchasesModule } from './modules/purchases/purchases.module';
+import { ReportsModule } from './modules/reports/reports.module';
 import { RolesModule } from './modules/roles/roles.module';
 import { SellingPriceGroupsModule } from './modules/selling-price-groups/selling-price-groups.module';
+import { StockAdjustmentsModule } from './modules/stock-adjustments/stock-adjustments.module';
+import { StockTransfersModule } from './modules/stock-transfers/stock-transfers.module';
+import { WastageTypesModule } from './modules/wastage-types/wastage-types.module';
 import { TaxRatesModule } from './modules/tax-rates/tax-rates.module';
 import { UnitsModule } from './modules/units/units.module';
 import { VariationTemplatesModule } from './modules/variation-templates/variation-templates.module';
@@ -68,6 +79,8 @@ import { UsersModule } from './modules/users/users.module';
     CommissionAgentsModule,
     ContactsModule,
     CustomerGroupsModule,
+    ExpenseCategoriesModule,
+    ExpensesModule,
     BusinessSettingsModule,
     BusinessLocationsModule,
     InvoiceSchemesModule,
@@ -88,6 +101,15 @@ import { UsersModule } from './modules/users/users.module';
     PurchaseRequisitionsModule,
     PurchaseOrdersModule,
     PurchaseReturnsModule,
+    OpeningStockModule,
+    SellsModule,
+    SalesOrdersModule,
+    SellReturnsModule,
+    AccountsModule,
+    WastageTypesModule,
+    StockAdjustmentsModule,
+    StockTransfersModule,
+    ReportsModule,
     ActivityLogModule,
     HealthModule,
   ],
