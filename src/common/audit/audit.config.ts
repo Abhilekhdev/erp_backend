@@ -47,6 +47,9 @@ export const AUDITED_MODELS: Record<string, AuditedModel> = {
   // with no diff — the same reason Product is `manual`.
   Purchase: { label: 'Purchase', manual: true },
   PurchasePayment: { label: 'Purchase payment', manual: true },
+  PurchaseRequisition: { label: 'Purchase requisition', manual: true },
+  PurchaseOrder: { label: 'Purchase order', manual: true },
+  PurchaseReturn: { label: 'Purchase return', manual: true },
   // Sell, StockTransfer and the rest join as they are built.
 };
 

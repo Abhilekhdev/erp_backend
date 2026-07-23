@@ -12,6 +12,7 @@ import type {
   SavePaymentDto,
 } from './dto/purchases-query.dto';
 import type { PurchaseLineInput, SavePurchaseDto } from './dto/save-purchase.dto';
+import { applyDrawDowns, recomputeDrawDownStatus } from './draw-down';
 import { calcLine, calcTotals, paymentStatusFor, round4 } from './purchase.calc';
 
 const STATUS: Record<string, TransactionStatus> = {
@@ -130,6 +131,7 @@ export class PurchasesService {
           lotNumber: blank(line.lot_number),
           mfgDate: date(line.mfg_date),
           expDate: date(line.exp_date),
+          purchaseOrderLineId: line.purchase_order_line_id ?? null,
         },
         lineTotal: calc.lineTotal,
       };
@@ -223,6 +225,7 @@ export class PurchasesService {
             customField2: blank(dto.custom_field_2),
             customField3: blank(dto.custom_field_3),
             customField4: blank(dto.custom_field_4),
+            purchaseOrderIds: dto.purchase_order_ids?.length ? dto.purchase_order_ids : Prisma.JsonNull,
             createdBy: user.sub,
           },
         });
@@ -235,6 +238,15 @@ export class PurchasesService {
             ...l.data,
           })),
         });
+
+        // Receiving against a purchase order consumes it and may complete it.
+        const touched = await applyDrawDowns(
+          tx,
+          built.lines
+            .filter((l) => l.data.purchaseOrderLineId)
+            .map((l) => ({ lineId: l.data.purchaseOrderLineId as number, delta: l.quantityBase })),
+        );
+        await recomputeDrawDownStatus(tx, touched);
 
         if (this.postsStock(status, isApproved)) {
           await this.stock.moveMany(tx, built.lines.map((l) => this.movement(dto.location_id, l, l.quantityBase)));
@@ -337,6 +349,15 @@ export class PurchasesService {
           }
         }
 
+        // Hand back everything the old lines took from their purchase orders, then take afresh —
+        // the same reverse-then-reapply shape as the stock above.
+        const giveBack = existing.purchaseLines
+          .filter((l) => l.purchaseOrderLineId)
+          .map((l) => ({ lineId: l.purchaseOrderLineId as number, delta: -Number(l.quantity) }));
+        const take = built.lines
+          .filter((l) => l.data.purchaseOrderLineId)
+          .map((l) => ({ lineId: l.data.purchaseOrderLineId as number, delta: l.quantityBase }));
+
         await tx.purchaseLine.deleteMany({ where: { transactionId: id } });
         await tx.purchaseLine.createMany({
           data: built.lines.map((l) => ({
@@ -346,6 +367,9 @@ export class PurchasesService {
             ...l.data,
           })),
         });
+
+        const touched = await applyDrawDowns(tx, [...giveBack, ...take]);
+        await recomputeDrawDownStatus(tx, touched);
 
         if (nowPosting) {
           await this.stock.moveMany(tx, built.lines.map((l) => this.movement(locationId, l, l.quantityBase)));
@@ -381,6 +405,7 @@ export class PurchasesService {
             customField2: blank(dto.custom_field_2),
             customField3: blank(dto.custom_field_3),
             customField4: blank(dto.custom_field_4),
+            purchaseOrderIds: dto.purchase_order_ids?.length ? dto.purchase_order_ids : Prisma.JsonNull,
           },
         });
 
@@ -549,7 +574,15 @@ export class PurchasesService {
           });
         }
       }
+      // Give the purchase orders their quantities back, so a deleted receipt reopens the order
+      // instead of leaving it stuck at partial forever (GOURI just nulls the link and walks away).
+      const giveBack = purchase.purchaseLines
+        .filter((l) => l.purchaseOrderLineId)
+        .map((l) => ({ lineId: l.purchaseOrderLineId as number, delta: -Number(l.quantity) }));
+      const touched = await applyDrawDowns(tx, giveBack);
+
       await tx.transaction.delete({ where: { id } }); // lines + payments cascade
+      await recomputeDrawDownStatus(tx, touched);
     });
 
     this.audit.log({

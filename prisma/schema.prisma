@@ -1736,9 +1736,10 @@ model VariationGroupPrice {
 /// What business event a transaction row represents (GOURI `transactions.type`).
 /// The full set is declared up front so adding a module never needs an enum migration.
 enum TransactionType {
-  PURCHASE          @map("purchase")
-  PURCHASE_ORDER    @map("purchase_order")
-  PURCHASE_RETURN   @map("purchase_return")
+  PURCHASE              @map("purchase")
+  PURCHASE_ORDER        @map("purchase_order")
+  PURCHASE_REQUISITION  @map("purchase_requisition")
+  PURCHASE_RETURN       @map("purchase_return")
   PURCHASE_TRANSFER @map("purchase_transfer")
   OPENING_STOCK     @map("opening_stock")
   SELL              @map("sell")
@@ -1755,12 +1756,25 @@ enum TransactionType {
 /// Document lifecycle. GOURI uses ONE column for two disjoint domains: a purchase may only be
 /// received/pending/ordered (`Util::orderStatuses`), a sell only draft/final. Both live here; the
 /// service layer enforces which set applies to which type.
+/// Where a purchase order physically is. GOURI keeps this as a free string.
+enum ShippingStatus {
+  ORDERED   @map("ordered")
+  PACKED    @map("packed")
+  SHIPPED   @map("shipped")
+  DELIVERED @map("delivered")
+  CANCELLED @map("cancelled")
+}
+
 enum TransactionStatus {
   RECEIVED @map("received")
   PENDING  @map("pending")
   ORDERED  @map("ordered")
   DRAFT    @map("draft")
   FINAL    @map("final")
+  /// Requisitions and purchase orders only: some of the ordered quantity has been drawn down.
+  PARTIAL   @map("partial")
+  /// Requisitions and purchase orders only: every ordered unit has been drawn down.
+  COMPLETED @map("completed")
 }
 
 enum DiscountType {
@@ -1826,6 +1840,17 @@ model Transaction {
   returnParentId Int? @map("return_parent_id")
   /// The incoming leg of a stock transfer points at the outgoing one.
   transferParentId Int? @map("transfer_parent_id")
+  /// Purchase orders this purchase draws down: `[1, 7]`. GOURI stores the same array as JSON text.
+  purchaseOrderIds Json? @map("purchase_order_ids")
+  /// Requisitions this purchase order draws down.
+  purchaseRequisitionIds Json? @map("purchase_requisition_ids")
+
+  // ── ordering / shipping (purchase orders and requisitions) ──
+  /// A requisition's "required by" date; a purchase order's expected delivery date.
+  deliveryDate    DateTime?       @map("delivery_date")
+  shippingAddress String?         @map("shipping_address") @db.Text
+  shippingStatus  ShippingStatus? @map("shipping_status")
+  deliveredTo     String?         @map("delivered_to") @db.VarChar(191)
 
   additionalNotes String? @map("additional_notes") @db.Text
   staffNote       String? @map("staff_note") @db.Text
@@ -1898,6 +1923,18 @@ model PurchaseLine {
   mfgDate   DateTime? @map("mfg_date") @db.Date
   expDate   DateTime? @map("exp_date") @db.Date
 
+  // ── where this line came from, and what has been drawn off it ──
+  /// A purchase line points at the purchase-order line it receives against.
+  purchaseOrderLineId Int? @map("purchase_order_line_id")
+  /// A purchase-order line points at the requisition line it fulfils.
+  purchaseRequisitionLineId Int? @map("purchase_requisition_line_id")
+  /// How much of THIS line (a requisition or purchase-order line) has been drawn down by the
+  /// document below it. Only ever changed through an atomic increment — GOURI reads, adds in PHP
+  /// and saves, so two concurrent receipts lose one of the updates.
+  poQuantityPurchased Decimal @default(0) @map("po_quantity_purchased") @db.Decimal(22, 4)
+  /// A return line points at the purchase line it sends back.
+  parentLineId Int? @map("parent_line_id")
+
   createdAt DateTime? @default(now()) @map("created_at")
   updatedAt DateTime? @updatedAt @map("updated_at")
 
@@ -1912,6 +1949,9 @@ model PurchaseLine {
   // FIFO consumption reads "the oldest lots of this variation that still have stock".
   @@index([variationId, expDate])
   @@index([lotNumber])
+  @@index([purchaseOrderLineId])
+  @@index([purchaseRequisitionLineId])
+  @@index([parentLineId])
   @@map("purchase_lines")
 }
 

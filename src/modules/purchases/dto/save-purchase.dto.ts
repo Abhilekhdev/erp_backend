@@ -15,6 +15,8 @@ const optStr = z.preprocess(blank, z.string().max(191).optional());
 export const purchaseLineSchema = z.object({
   /** Set when editing an existing line; absent means a new line. */
   purchase_line_id: optId,
+  /** The purchase-order line this receives against, when the purchase was raised from one. */
+  purchase_order_line_id: optId,
   product_id: z.coerce.number().int().positive(),
   variation_id: z.coerce.number().int().positive(),
   quantity: z.coerce.number().positive('Quantity must be greater than zero'),
@@ -81,6 +83,8 @@ export const savePurchaseSchema = z.object({
   custom_field_3: optStr,
   custom_field_4: optStr,
 
+  /** Purchase orders this receipt draws down. */
+  purchase_order_ids: z.array(z.coerce.number().int().positive()).optional(),
   purchases: z.array(purchaseLineSchema).min(1, 'Add at least one product'),
   /** Payments are accepted on create; edits leave existing payments alone (GOURI parity). */
   payment: z.array(purchasePaymentSchema).optional(),

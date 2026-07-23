@@ -28,6 +28,9 @@ import { NotificationTemplatesModule } from './modules/notification-templates/no
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { PermissionsModule } from './modules/permissions/permissions.module';
 import { ProductsModule } from './modules/products/products.module';
+import { PurchaseOrdersModule } from './modules/purchase-orders/purchase-orders.module';
+import { PurchaseRequisitionsModule } from './modules/purchase-requisitions/purchase-requisitions.module';
+import { PurchaseReturnsModule } from './modules/purchase-returns/purchase-returns.module';
 import { PurchasesModule } from './modules/purchases/purchases.module';
 import { RolesModule } from './modules/roles/roles.module';
 import { SellingPriceGroupsModule } from './modules/selling-price-groups/selling-price-groups.module';
@@ -82,6 +85,9 @@ import { UsersModule } from './modules/users/users.module';
     ProductsModule,
     BarcodesModule,
     PurchasesModule,
+    PurchaseRequisitionsModule,
+    PurchaseOrdersModule,
+    PurchaseReturnsModule,
     ActivityLogModule,
     HealthModule,
   ],
